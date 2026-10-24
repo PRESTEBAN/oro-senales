@@ -687,14 +687,36 @@ def fmt_t(t):
 
 
 def merge_signals(*lists):
-    """Junta las senales de v8 y v9: misma vela y mismo lado = un solo aviso."""
+    """Junta las senales de v8 y v9 en UN aviso por etiqueta.
+    1) misma vela de confirmacion y mismo lado -> un solo grupo [v8 + v9];
+    2) si otro indicador confirma MAS TARDE la misma etiqueta (mismo pico/suelo),
+       no se avisa de nuevo: se anota en 'dups' (solo para el modo history)."""
     groups = {}
     for lst in lists:
         for s in lst:
             groups.setdefault((s["side"], s["i"]), []).append(s)
-    out = [dict(side=side, i=i, items=sorted(v, key=lambda x: x["ver"]))
-           for (side, i), v in groups.items()]
-    out.sort(key=lambda g: (g["i"], g["side"]))
+    ordered = [dict(side=side, i=i, items=sorted(v, key=lambda x: x["ver"]), dups=[])
+               for (side, i), v in groups.items()]
+    ordered.sort(key=lambda g: (g["i"], g["side"]))
+
+    seen = {}   # (lado, vela de la etiqueta) -> {"vers": versiones ya avisadas, "group": grupo}
+    out = []
+    for g in ordered:
+        keep = []
+        for x in g["items"]:
+            k = (g["side"], x["label_i"])
+            prev = seen.get(k)
+            if prev and x["ver"] not in prev["vers"]:
+                prev["group"]["dups"].append(x)
+                continue
+            keep.append(x)
+        if not keep:
+            continue
+        g["items"] = keep
+        for x in keep:
+            k = (g["side"], x["label_i"])
+            seen.setdefault(k, {"vers": set(), "group": g})["vers"].add(x["ver"])
+        out.append(g)
     return out
 
 
@@ -813,6 +835,9 @@ def main():
             print("%-6s [%-7s] %s | etiqueta en %s | confirmada %s | cierre %.2f SL %.2f"
                   % (g["side"], tags, det, fmt_t(bars[x["label_i"]]["t"]),
                      fmt_t(bars[g["i"]]["t"] + BAR), x["close"], x["sl"]))
+            for d in g["dups"]:
+                print("       + %s confirma la misma etiqueta a las %s (no se avisa aparte)"
+                      % (d["ver"], fmt_t(bars[d["i"]]["t"] + BAR)))
         return
 
     n = len(bars)
