@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Oro SMC v9 -> avisos por Telegram.
+Oro SMC v8 + v9 -> avisos por Telegram.
 Corre en GitHub Actions cada 5 minutos. Cada ejecucion:
   1) baja ~3000 velas de XAU/USD 15m de Twelve Data,
-  2) repasa TODA la logica del indicador v9 vela por vela,
-  3) si una de las ultimas 2 velas cerradas disparo COMPRA/VENTA y no se
-     aviso antes, manda un mensaje por Telegram.
+  2) repasa TODA la logica de los indicadores v8 y v9 vela por vela,
+  3) si una de las ultimas 2 velas cerradas disparo COMPRA/VENTA (en v8, en v9
+     o en ambos) y no se aviso antes, manda UN mensaje por Telegram.
 
 Modos:  python signal_bot.py --mode normal    (el de siempre)
         python signal_bot.py --mode test      (manda un mensaje de prueba)
@@ -207,7 +207,8 @@ def build_context(bars):
 # ============================================================================
 # Motor de senales (port fiel del Pine v9)
 # ============================================================================
-def run_engine(bars):
+def run_engine(bars, v9=True):
+    """v9=True: indicador v9. v9=False: indicador v8 (sin los 4 cambios del Modelo B)."""
     n = len(bars)
     O = [b["o"] for b in bars]
     H = [b["h"] for b in bars]
@@ -431,10 +432,10 @@ def run_engine(bars):
 
         if bState == 2:
             R = bHigh - bLowPx
-            faB = CONT_FIB_A if bCont else fibA
+            faB = CONT_FIB_A if (bCont and v9) else fibA
             zTop = bHigh - faB * R
             zBot = bHigh - fibB * R
-            legMin = (CONT_MIN_LEG_ATR if bCont else minLegATR) * a
+            legMin = (CONT_MIN_LEG_ATR if (bCont and v9) else minLegATR) * a
             if c < bLowPx or i - bMssBar > setupWait:
                 bState = 0
             elif i > bMssBar and R >= legMin and l <= zTop:
@@ -507,7 +508,7 @@ def run_engine(bars):
             bPdl = bullSweepPdl
             bCont = False
 
-        if ((bState == 0 or (CONT_REARM and bState == 2 and i > bMssBar)) and CONT_ON and htfBull
+        if ((bState == 0 or (CONT_REARM and v9 and bState == 2 and i > bMssBar)) and CONT_ON and htfBull
                 and lastHighI is not None and lastLowI is not None
                 and lastHighIBar < lastLowIBar and (i - lastLowIBar) <= CONT_MAX_LEG
                 and c > lastHighI and c_prev is not None and c_prev <= lastHighI
@@ -529,9 +530,11 @@ def run_engine(bars):
             bScore += 1 if bObV else 0
             bScore += 1 if bFvgV else 0
             bScore += 1 if (USE_HTF and htfBull) else 0
-            bScore += (1 if trendUp else 0) if bCont else (1 if c < eq else 0)
-            bScore += 1 if (USE_VP and poc is not None and c <= poc) else 0
+            bScore += (1 if trendUp else 0) if (bCont and v9) else (1 if c < eq else 0)
+            vpB = 1 if (USE_VP and poc is not None and c <= poc) else 0
+            bScore += vpB
             need = CONT_MIN_SCORE if bCont else MIN_SCORE
+            bNeed = need
             buySig = bScore >= need and coolOK and (not REQ_HTF or htfBull)
 
         # ================= BAJISTA =================
@@ -554,10 +557,10 @@ def run_engine(bars):
 
         if sState == 2:
             Rs = sHighPx - sLow
-            faS = CONT_FIB_A if sCont else fibA
+            faS = CONT_FIB_A if (sCont and v9) else fibA
             zBotS = sLow + faS * Rs
             zTopS = sLow + fibB * Rs
-            legMinS = (CONT_MIN_LEG_ATR if sCont else minLegATR) * a
+            legMinS = (CONT_MIN_LEG_ATR if (sCont and v9) else minLegATR) * a
             if c > sHighPx or i - sMssBar > setupWait:
                 sState = 0
             elif i > sMssBar and Rs >= legMinS and h >= zBotS:
@@ -630,7 +633,7 @@ def run_engine(bars):
             sPdh = bearSweepPdh
             sCont = False
 
-        if ((sState == 0 or (CONT_REARM and sState == 2 and i > sMssBar)) and CONT_ON and htfBear
+        if ((sState == 0 or (CONT_REARM and v9 and sState == 2 and i > sMssBar)) and CONT_ON and htfBear
                 and lastHighI is not None and lastLowI is not None
                 and lastLowIBar < lastHighIBar and (i - lastHighIBar) <= CONT_MAX_LEG
                 and c < lastLowI and c_prev is not None and c_prev >= lastLowI
@@ -652,21 +655,25 @@ def run_engine(bars):
             sScore += 1 if sObV else 0
             sScore += 1 if sFvgV else 0
             sScore += 1 if (USE_HTF and htfBear) else 0
-            sScore += (1 if trendDn else 0) if sCont else (1 if c > eq else 0)
-            sScore += 1 if (USE_VP and poc is not None and c >= poc) else 0
+            sScore += (1 if trendDn else 0) if (sCont and v9) else (1 if c > eq else 0)
+            vpS = 1 if (USE_VP and poc is not None and c >= poc) else 0
+            sScore += vpS
             need = CONT_MIN_SCORE if sCont else MIN_SCORE
+            sNeed = need
             sellSig = sScore >= need and coolOK and (not REQ_HTF or htfBear)
 
         # ================= Ejecucion =================
         if buySig:
             lastSig = i
             sigs.append(dict(side="COMPRA", i=i, label_i=bLowBar, close=c, sl=bSl,
-                             score=bScore, model="B" if bCont else "A"))
+                             score=bScore, model="B" if bCont else "A",
+                             ver="v9" if v9 else "v8", vp_decisive=(bScore - vpB) < bNeed))
             bState = 0
         if sellSig:
             lastSig = i
             sigs.append(dict(side="VENTA", i=i, label_i=sHighBar, close=c, sl=sSl,
-                             score=sScore, model="B" if sCont else "A"))
+                             score=sScore, model="B" if sCont else "A",
+                             ver="v9" if v9 else "v8", vp_decisive=(sScore - vpS) < sNeed))
             sState = 0
 
     return sigs
@@ -679,29 +686,52 @@ def fmt_t(t):
     return t.astimezone(EC).strftime("%d/%m %H:%M")
 
 
-def build_message(sig, bars):
-    b = bars[sig["i"]]
+def merge_signals(*lists):
+    """Junta las senales de v8 y v9: misma vela y mismo lado = un solo aviso."""
+    groups = {}
+    for lst in lists:
+        for s in lst:
+            groups.setdefault((s["side"], s["i"]), []).append(s)
+    out = [dict(side=side, i=i, items=sorted(v, key=lambda x: x["ver"]))
+           for (side, i), v in groups.items()]
+    out.sort(key=lambda g: (g["i"], g["side"]))
+    return out
+
+
+def build_message(group, bars):
+    items = group["items"]
+    b = bars[group["i"]]
     close_time = b["t"] + BAR
-    risk = abs(sig["close"] - sig["sl"])
-    if sig["side"] == "COMPRA":
-        tp = sig["close"] + RR * risk
-        icon = "\U0001F7E2"
+    side = group["side"]
+    icon = "\U0001F7E2" if side == "COMPRA" else "\U0001F534"
+    tag = " + ".join(x["ver"] for x in items)
+    close = items[0]["close"]
+
+    lines = ["%s %s %s 15m  [%s]" % (icon, side, SYMBOL, tag)]
+    for x in items:
+        modelo = "B (continuacion)" if x["model"] == "B" else "A (barrido)"
+        maxs = 5 if x["model"] == "B" else 6
+        lines.append("%s: Modelo %s | Puntuacion %d/%d" % (x["ver"], modelo, x["score"], maxs))
+    lines.append("Cierre de vela: %.2f" % close)
+
+    def sl_tp(x):
+        risk = abs(x["close"] - x["sl"])
+        tp = x["close"] + RR * risk if side == "COMPRA" else x["close"] - RR * risk
+        return risk, tp
+
+    if len(items) == 1 or all(abs(x["sl"] - items[0]["sl"]) < 0.005 for x in items):
+        risk, tp = sl_tp(items[0])
+        lines.append("SL: %.2f (riesgo $%.2f)" % (items[0]["sl"], risk))
+        lines.append("TP 1:%g: %.2f" % (RR, tp))
     else:
-        tp = sig["close"] - RR * risk
-        icon = "\U0001F534"
-    modelo = "B (continuacion)" if sig["model"] == "B" else "A (barrido)"
-    maxs = 5 if sig["model"] == "B" else 6
-    return (
-        "%s %s %s 15m\n"
-        "Modelo %s | Puntuacion %d/%d\n"
-        "Cierre de vela: %.2f\n"
-        "SL: %.2f (riesgo $%.2f)\n"
-        "TP 1:%g: %.2f\n"
-        "Vela cerrada: %s (hora Ecuador)\n\n"
-        "Precios del feed Twelve Data: pueden diferir unos dolares de TradingView. "
-        "Confirma en tu grafico antes de operar."
-    ) % (icon, sig["side"], SYMBOL, modelo, sig["score"], maxs, sig["close"], sig["sl"],
-         risk, RR, tp, fmt_t(close_time))
+        for x in items:
+            risk, tp = sl_tp(x)
+            lines.append("%s -> SL %.2f (riesgo $%.2f) | TP 1:%g %.2f" % (x["ver"], x["sl"], risk, RR, tp))
+    lines.append("Vela cerrada: %s (hora Ecuador)" % fmt_t(close_time))
+    lines.append("")
+    lines.append("Precios del feed Twelve Data: pueden diferir unos dolares de TradingView. "
+                 "Confirma en tu grafico antes de operar.")
+    return "\n".join(lines)
 
 
 def send_telegram(text):
@@ -770,20 +800,25 @@ def main():
           % (len(bars), last_close_time.strftime("%Y-%m-%d %H:%M"),
              now.strftime("%Y-%m-%d %H:%M"), age_last, FREQ))
 
-    sigs = run_engine(bars)
+    groups = merge_signals(run_engine(bars, v9=False), run_engine(bars, v9=True))
 
     if args.mode == "history":
-        print("Senales en el historial (%d). Comparalas con las etiquetas de TradingView:" % len(sigs))
-        for s in sigs:
-            print("%-6s modelo %s punt %d | etiqueta en %s | confirmada %s | cierre %.2f SL %.2f"
-                  % (s["side"], s["model"], s["score"], fmt_t(bars[s["label_i"]]["t"]),
-                     fmt_t(bars[s["i"]]["t"] + BAR), s["close"], s["sl"]))
+        print("Senales en el historial (%d). Comparalas con las etiquetas de TradingView:" % len(groups))
+        print("(* = la senal depende del punto del perfil de volumen, que aqui se calcula sin volumen real)")
+        for g in groups:
+            x = g["items"][0]
+            tags = " + ".join(y["ver"] for y in g["items"])
+            det = " / ".join("%s %s p%d%s" % (y["ver"], y["model"], y["score"], "*" if y["vp_decisive"] else "")
+                             for y in g["items"])
+            print("%-6s [%-7s] %s | etiqueta en %s | confirmada %s | cierre %.2f SL %.2f"
+                  % (g["side"], tags, det, fmt_t(bars[x["label_i"]]["t"]),
+                     fmt_t(bars[g["i"]]["t"] + BAR), x["close"], x["sl"]))
         return
 
     n = len(bars)
     state = load_state()
     changed = False
-    fresh = [s for s in sigs if s["i"] >= n - LOOKBACK_BARS]
+    fresh = [g for g in groups if g["i"] >= n - LOOKBACK_BARS]
     if not fresh:
         print("Sin senales nuevas en las ultimas %d velas." % LOOKBACK_BARS)
     for s in fresh:
