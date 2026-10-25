@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "normal = revisar senales | test = mensaje de prueba | history = senales del historial | velas = ultimas velas para comparar | feeds = comparar fuentes de datos"
+        description: "normal = revisar senales | test = mensaje de prueba | history = senales del historial | velas = ultimas velas para comparar | feeds = comparar fuentes de datos | dukalive = medir retraso de Dukascopy"
         type: choice
         default: normal
         options:
@@ -15,6 +15,7 @@ on:
           - history
           - velas
           - feeds
+          - dukalive
 
 permissions:
   contents: write
