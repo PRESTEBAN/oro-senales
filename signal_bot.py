@@ -807,6 +807,7 @@ TV_REF = [
     ("2026-10-23 02:00", 3992.155, 4014.140, 3986.730, 4013.170),   # 22/10 21:00 Ecuador
 ]
 DUKA_LAST_HEADERS = {}
+DUKA_DAYS = 32   # dias que baja el modo histduka
 DUKA_URL = "https://datafeed.dukascopy.com/datafeed/XAUUSD/%04d/%02d/%02d/%s_candles_min_1.bi5"
 
 
@@ -970,9 +971,78 @@ def run_dukalive(args):
             print("  %-12s %-12s sin datos de Twelve Data" % ("", "Twelve Data"))
 
 
+def print_history(groups, bars):
+    print("Senales en el historial (%d). Comparalas con las etiquetas de TradingView:" % len(groups))
+    print("(* = la senal depende del punto del perfil de volumen, que aqui se calcula sin volumen real)")
+    for g in groups:
+        x = g["items"][0]
+        tags = " + ".join(y["ver"] for y in g["items"])
+        det = " / ".join("%s %s p%d%s" % (y["ver"], y["model"], y["score"], "*" if y["vp_decisive"] else "")
+                         for y in g["items"])
+        print("%-6s [%-7s] %s | etiqueta en %s | confirmada %s | cierre %.2f SL %.2f"
+              % (g["side"], tags, det, fmt_t(bars[x["label_i"]]["t"]),
+                 fmt_t(bars[g["i"]]["t"] + BAR), x["close"], x["sl"]))
+        for d in g["dups"]:
+            print("       + %s confirma la misma etiqueta a las %s (no se avisa aparte)"
+                  % (d["ver"], fmt_t(bars[d["i"]]["t"] + BAR)))
+
+
+def duka_bars(days_back, end_day):
+    """Velas de 15 min (precio medio) de Dukascopy de los ultimos 'days_back' dias UTC hasta end_day."""
+    from concurrent.futures import ThreadPoolExecutor
+    days = [end_day - timedelta(days=k) for k in range(days_back - 1, -1, -1)]
+    jobs = [(d, side) for d in days for side in ("BID", "ASK")]
+    t_limit = time.time() + 240
+
+    def work(job):
+        d, side = job
+        if time.time() > t_limit:
+            return job, {}, "omitido por tiempo"
+        got, note = duka_day(d, side)
+        return job, got, note
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        results = list(ex.map(work, jobs))
+    bid, ask = {}, {}
+    bad = []
+    for (d, side), got, note in results:
+        (bid if side == "BID" else ask).update(got)
+        if not got and d.weekday() < 5:          # sabado y domingo sin datos es normal
+            bad.append("%s %s: %s" % (d.isoformat(), side, note))
+    print("Dukascopy: %d archivos pedidos, %d velas de 1 min (BID) y %d (ASK)" % (len(jobs), len(bid), len(ask)))
+    if bad:
+        print("Archivos de dias de semana sin datos (%d):" % len(bad))
+        for b in bad[:12]:
+            print("   " + b)
+    buckets = sorted({m.replace(minute=(m.minute // 15) * 15) for m in set(bid) | set(ask)})
+    bars = []
+    for t0 in buckets:
+        c = duka_candle(bid, ask, t0)
+        if c:
+            bars.append(dict(t=t0, o=c["o"], h=c["h"], l=c["l"], c=c["c"], v=0.0))
+    return bars
+
+
+def run_histduka(args):
+    """Corre el motor (v8 + v9) sobre velas de Dukascopy, que se parecen casi al centavo a OANDA."""
+    now = datetime.now(timezone.utc)
+    end_day = now.date() - timedelta(days=1)        # ultimo dia UTC completo
+    raw = duka_bars(DUKA_DAYS, end_day)
+    if not raw:
+        sys.exit("Dukascopy no devolvio velas")
+    bars = clean_bars(raw, raw[-1]["t"] + BAR)
+    print("Velas de 15 min: %d | desde %s hasta %s (hora Ecuador) | modo %s"
+          % (len(bars), fmt_t(bars[0]["t"]), fmt_t(bars[-1]["t"] + BAR), FREQ))
+    if len(bars) < 300:
+        sys.exit("Muy pocas velas utiles (%d)" % len(bars))
+    print("(ignora las senales de los primeros 4-5 dias: el indicador necesita velas para calentarse)")
+    groups = merge_signals(run_engine(bars, v9=False), run_engine(bars, v9=True))
+    print_history(groups, bars)
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", default="normal", choices=["normal", "test", "history", "velas", "feeds", "dukalive"])
+    ap.add_argument("--mode", default="normal", choices=["normal", "test", "history", "velas", "feeds", "dukalive", "histduka"])
     ap.add_argument("--csv", help="(pruebas) leer velas de un CSV en vez de Twelve Data")
     args = ap.parse_args()
     now = datetime.now(timezone.utc)
@@ -988,6 +1058,10 @@ def main():
 
     if args.mode == "dukalive":
         run_dukalive(args)
+        return
+
+    if args.mode == "histduka":
+        run_histduka(args)
         return
 
     if args.mode == "normal" and not market_open(now):
@@ -1009,19 +1083,7 @@ def main():
     groups = merge_signals(run_engine(bars, v9=False), run_engine(bars, v9=True))
 
     if args.mode == "history":
-        print("Senales en el historial (%d). Comparalas con las etiquetas de TradingView:" % len(groups))
-        print("(* = la senal depende del punto del perfil de volumen, que aqui se calcula sin volumen real)")
-        for g in groups:
-            x = g["items"][0]
-            tags = " + ".join(y["ver"] for y in g["items"])
-            det = " / ".join("%s %s p%d%s" % (y["ver"], y["model"], y["score"], "*" if y["vp_decisive"] else "")
-                             for y in g["items"])
-            print("%-6s [%-7s] %s | etiqueta en %s | confirmada %s | cierre %.2f SL %.2f"
-                  % (g["side"], tags, det, fmt_t(bars[x["label_i"]]["t"]),
-                     fmt_t(bars[g["i"]]["t"] + BAR), x["close"], x["sl"]))
-            for d in g["dups"]:
-                print("       + %s confirma la misma etiqueta a las %s (no se avisa aparte)"
-                      % (d["ver"], fmt_t(bars[d["i"]]["t"] + BAR)))
+        print_history(groups, bars)
         return
 
     if args.mode == "velas":
