@@ -806,6 +806,7 @@ TV_REF = [
     ("2026-10-22 15:15", 4055.100, 4061.150, 4051.590, 4051.840),   # 22/10 10:15 Ecuador
     ("2026-10-23 02:00", 3992.155, 4014.140, 3986.730, 4013.170),   # 22/10 21:00 Ecuador
 ]
+DUKA_LAST_HEADERS = {}
 DUKA_URL = "https://datafeed.dukascopy.com/datafeed/XAUUSD/%04d/%02d/%02d/%s_candles_min_1.bi5"
 
 
@@ -825,6 +826,11 @@ def duka_day(d, side):
             time.sleep(3)
     if r is None:
         return {}, "sin conexion (%s)" % err
+    global DUKA_LAST_HEADERS
+    try:
+        DUKA_LAST_HEADERS = dict(r.headers)
+    except (TypeError, ValueError, AttributeError):
+        DUKA_LAST_HEADERS = {}
     if r.status_code != 200:
         return {}, "HTTP %d" % r.status_code
     if not r.content:
@@ -926,9 +932,47 @@ def run_feeds(args):
         print("Mas cercano a TradingView: %s%s" % (best, " (casi empate)" if gap < 0.15 else ""))
 
 
+def run_dukalive(args):
+    """Mide que tan al dia esta el archivo de HOY de Dukascopy y compara las ultimas velas con Twelve Data."""
+    now = datetime.now(timezone.utc)
+    print("Ahora: %s UTC (%s hora Ecuador)" % (now.strftime("%Y-%m-%d %H:%M:%S"), fmt_t(now)))
+    day = now.date()
+    sides = {}
+    for side in ("BID", "ASK"):
+        got, note = duka_day(day, side)
+        sides[side] = got
+        print("Dukascopy %s %s: %s" % (side, day.isoformat(), note))
+        h = {k.lower(): v for k, v in DUKA_LAST_HEADERS.items()}
+        print("   cabeceras: last-modified=%s | date=%s | age=%s | cache-control=%s"
+              % (h.get("last-modified", "-"), h.get("date", "-"), h.get("age", "-"), h.get("cache-control", "-")))
+        if got:
+            last = max(got)
+            lag = (now - (last + timedelta(minutes=1))).total_seconds() / 60.0
+            print("   ultima vela de 1 min: %s UTC | retraso respecto a ahora: %.1f min"
+                  % (last.strftime("%Y-%m-%d %H:%M"), lag))
+    print()
+    raw = load_csv(args.csv) if args.csv else fetch_bars()
+    td = {b["t"]: b for b in raw}
+    start = now.replace(minute=(now.minute // 15) * 15, second=0, microsecond=0)
+    print("Ultimas velas de 15 min ya cerradas (Dukascopy medio contra Twelve Data):")
+    print("  %-12s %-12s %10s %10s %10s %10s" % ("hora Ecuador", "fuente", "apertura", "maximo", "minimo", "cierre"))
+    for k in range(6, 0, -1):
+        t = start - timedelta(minutes=15 * k)
+        dv = duka_candle(sides["BID"], sides["ASK"], t)
+        tv = td.get(t)
+        if dv:
+            print("  %-12s %-12s %10.2f %10.2f %10.2f %10.2f" % (fmt_t(t), "Dukascopy", dv["o"], dv["h"], dv["l"], dv["c"]))
+        else:
+            print("  %-12s %-12s sin datos de Dukascopy" % (fmt_t(t), "Dukascopy"))
+        if tv:
+            print("  %-12s %-12s %10.2f %10.2f %10.2f %10.2f" % ("", "Twelve Data", tv["o"], tv["h"], tv["l"], tv["c"]))
+        else:
+            print("  %-12s %-12s sin datos de Twelve Data" % ("", "Twelve Data"))
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", default="normal", choices=["normal", "test", "history", "velas", "feeds"])
+    ap.add_argument("--mode", default="normal", choices=["normal", "test", "history", "velas", "feeds", "dukalive"])
     ap.add_argument("--csv", help="(pruebas) leer velas de un CSV en vez de Twelve Data")
     args = ap.parse_args()
     now = datetime.now(timezone.utc)
@@ -940,6 +984,10 @@ def main():
 
     if args.mode == "feeds":
         run_feeds(args)
+        return
+
+    if args.mode == "dukalive":
+        run_dukalive(args)
         return
 
     if args.mode == "normal" and not market_open(now):
