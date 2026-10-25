@@ -682,6 +682,9 @@ def run_engine(bars, v9=True):
 # ============================================================================
 # Telegram / estado / mensajes
 # ============================================================================
+VELAS_N = 150  # cuantas velas imprime el modo 'velas'
+
+
 def fmt_t(t):
     return t.astimezone(EC).strftime("%d/%m %H:%M")
 
@@ -796,7 +799,7 @@ def save_state(state):
 # ============================================================================
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", default="normal", choices=["normal", "test", "history"])
+    ap.add_argument("--mode", default="normal", choices=["normal", "test", "history", "velas"])
     ap.add_argument("--csv", help="(pruebas) leer velas de un CSV en vez de Twelve Data")
     args = ap.parse_args()
     now = datetime.now(timezone.utc)
@@ -838,6 +841,25 @@ def main():
             for d in g["dups"]:
                 print("       + %s confirma la misma etiqueta a las %s (no se avisa aparte)"
                       % (d["ver"], fmt_t(bars[d["i"]]["t"] + BAR)))
+        return
+
+    if args.mode == "velas":
+        # Para comparar con TradingView: ultimas velas con hora de APERTURA (hora Ecuador,
+        # igual que la hora que muestra TradingView al pasar el mouse) y su O/H/L/C.
+        marks = {}
+        for g in groups:
+            for it in g["items"] + g["dups"]:
+                tag = "%s %s" % (g["side"], it["ver"])
+                marks.setdefault(it["label_i"], []).append("ETIQUETA " + tag)
+            marks.setdefault(g["i"], []).append("aviso %s" % g["side"])
+        last = bars[-VELAS_N:]
+        first_i = len(bars) - len(last)
+        print("Ultimas %d velas de %s (15m), hora de apertura = hora Ecuador (UTC-5):" % (len(last), SYMBOL))
+        print("hora         |   apertura    maximo     minimo     cierre | marcas")
+        for k, b in enumerate(last):
+            m = ", ".join(marks.get(first_i + k, []))
+            print("%s | %10.2f %10.2f %10.2f %10.2f | %s"
+                  % (fmt_t(b["t"]), b["o"], b["h"], b["l"], b["c"], m))
         return
 
     n = len(bars)
