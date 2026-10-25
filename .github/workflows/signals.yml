@@ -6,13 +6,14 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "normal = revisar senales | test = mensaje de prueba | history = senales del historial"
+        description: "normal = revisar senales | test = mensaje de prueba | history = senales del historial | velas = ultimas velas para comparar"
         type: choice
         default: normal
         options:
           - normal
           - test
           - history
+          - velas
 
 permissions:
   contents: write
