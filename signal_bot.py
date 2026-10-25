@@ -797,9 +797,138 @@ def save_state(state):
 # ============================================================================
 # Main
 # ============================================================================
+# ============================================================================
+# Modo feeds: compara Twelve Data y Dukascopy contra velas medidas en TradingView
+# ============================================================================
+TV_REF = [
+    # (hora UTC de apertura, apertura, maximo, minimo, cierre) medidas en TradingView (OANDA)
+    ("2026-10-22 15:00", 4059.635, 4063.105, 4053.845, 4055.010),   # 22/10 10:00 Ecuador
+    ("2026-10-22 15:15", 4055.100, 4061.150, 4051.590, 4051.840),   # 22/10 10:15 Ecuador
+    ("2026-10-23 02:00", 3992.155, 4014.140, 3986.730, 4013.170),   # 22/10 21:00 Ecuador
+]
+DUKA_URL = "https://datafeed.dukascopy.com/datafeed/XAUUSD/%04d/%02d/%02d/%s_candles_min_1.bi5"
+
+
+def duka_day(d, side):
+    """Baja las velas de 1 minuto de un dia (UTC) de Dukascopy. Devuelve (dict minuto->vela, nota)."""
+    import lzma
+    import struct
+    url = DUKA_URL % (d.year, d.month - 1, d.day, side)   # el mes cuenta desde 0
+    r = None
+    err = "?"
+    for _ in range(3):
+        try:
+            r = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+            break
+        except requests.RequestException as e:
+            err = type(e).__name__
+            time.sleep(3)
+    if r is None:
+        return {}, "sin conexion (%s)" % err
+    if r.status_code != 200:
+        return {}, "HTTP %d" % r.status_code
+    if not r.content:
+        return {}, "archivo vacio"
+    try:
+        buf = lzma.LZMADecompressor(format=lzma.FORMAT_AUTO).decompress(r.content)
+    except lzma.LZMAError as e:
+        return {}, "no se pudo descomprimir (%s)" % e
+    n = len(buf) // 24
+    if n == 0:
+        return {}, "sin velas"
+    recs = [struct.unpack(">5If", buf[i * 24:(i + 1) * 24]) for i in range(n)]
+
+    def ok_a(x):                      # orden (apertura, cierre, minimo, maximo)
+        o, c, l, h = x[1:5]
+        return l <= min(o, c) and h >= max(o, c)
+
+    def ok_b(x):                      # orden (apertura, maximo, minimo, cierre)
+        o, h, l, c = x[1:5]
+        return l <= min(o, c) and h >= max(o, c)
+
+    na = sum(1 for x in recs if ok_a(x))
+    nb = sum(1 for x in recs if ok_b(x))
+    order = "A" if na >= nb else "B"
+    vals = sorted(x[1] for x in recs)
+    med = vals[len(vals) // 2]
+    div = next((dv for dv in (1000, 100000, 100, 10, 1) if 500 < med / dv < 20000), 1000)
+    day0 = datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
+    out = {}
+    for x in recs:
+        if order == "A":
+            o, c, l, h = [v / div for v in x[1:5]]
+        else:
+            o, h, l, c = [v / div for v in x[1:5]]
+        out[day0 + timedelta(seconds=x[0])] = dict(o=o, h=h, l=l, c=c)
+    return out, "%d velas de 1 min | orden %s (%d de %d coherentes) | divisor %d" % (n, order, max(na, nb), n, div)
+
+
+def duka_candle(bid, ask, t0):
+    """Arma la vela de 15 min (precio medio bid/ask, como muestra TradingView) desde las de 1 min."""
+    rows = []
+    for k in range(15):
+        m = t0 + timedelta(minutes=k)
+        b, a = bid.get(m), ask.get(m)
+        if b and a:
+            rows.append({f: (b[f] + a[f]) / 2 for f in "ohlc"})
+        elif b or a:
+            rows.append(dict(b or a))
+    if not rows:
+        return None
+    return dict(o=rows[0]["o"], h=max(x["h"] for x in rows), l=min(x["l"] for x in rows),
+                c=rows[-1]["c"])
+
+
+def run_feeds(args):
+    raw = load_csv(args.csv) if args.csv else fetch_bars()
+    td = {b["t"]: b for b in raw}
+    refs = []
+    for hs, o, h, l, c in TV_REF:
+        t = datetime.strptime(hs, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+        refs.append((t, dict(o=o, h=h, l=l, c=c)))
+    duka = {"BID": {}, "ASK": {}}
+    for d in sorted({t.date() for t, _ in refs}):
+        for side in ("BID", "ASK"):
+            got, note = duka_day(d, side)
+            duka[side].update(got)
+            print("Dukascopy %s %s: %s" % (side, d.isoformat(), note))
+    print()
+
+    def show(name, v):
+        print("  %-18s %10.2f %10.2f %10.2f %10.2f %8.2f" % (name, v["o"], v["h"], v["l"], v["c"], v["h"] - v["l"]))
+
+    errs = {"Twelve Data": [], "Dukascopy": []}
+    for t, tv in refs:
+        print("Vela %s (hora Ecuador) = %s UTC" % (fmt_t(t), t.strftime("%Y-%m-%d %H:%M")))
+        print("  %-18s %10s %10s %10s %10s %8s" % ("fuente", "apertura", "maximo", "minimo", "cierre", "rango"))
+        show("TradingView", tv)
+        for key, name, v in (("Twelve Data", "Twelve Data", td.get(t)),
+                             ("Dukascopy", "Dukascopy (medio)", duka_candle(duka["BID"], duka["ASK"], t))):
+            if v is None:
+                print("  %-18s sin dato para esta vela" % name)
+                continue
+            show(name, v)
+            diff = [v[f] - tv[f] for f in "ohlc"]
+            print("  %-18s %+10.2f %+10.2f %+10.2f %+10.2f" % ("   dif. vs TV", *diff))
+            errs[key].extend(abs(x) for x in diff)
+        print()
+    print("RESUMEN (diferencia media absoluta contra TradingView, en dolares):")
+    means = {}
+    for key, lst in errs.items():
+        if lst:
+            means[key] = sum(lst) / len(lst)
+            print("  %-12s %.2f  (%d valores)" % (key, means[key], len(lst)))
+        else:
+            print("  %-12s sin datos" % key)
+    if len(means) == 2:
+        best = min(means, key=means.get)
+        gap = abs(means["Twelve Data"] - means["Dukascopy"])
+        print("Mas cercano a TradingView: %s%s" % (best, " (casi empate)" if gap < 0.15 else ""))
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", default="normal", choices=["normal", "test", "history", "velas"])
+    ap.add_argument("--mode", default="normal", choices=["normal", "test", "history", "velas", "feeds"])
     ap.add_argument("--csv", help="(pruebas) leer velas de un CSV en vez de Twelve Data")
     args = ap.parse_args()
     now = datetime.now(timezone.utc)
@@ -808,6 +937,10 @@ def main():
         ok = send_telegram("\u2705 Bot de senales conectado. Si ves este mensaje, Telegram funciona.")
         print("Mensaje de prueba enviado" if ok else "No se pudo enviar el mensaje de prueba")
         sys.exit(0 if ok else 1)
+
+    if args.mode == "feeds":
+        run_feeds(args)
+        return
 
     if args.mode == "normal" and not market_open(now):
         print("Mercado cerrado, nada que revisar.")
