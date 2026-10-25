@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "normal = revisar senales | test = mensaje de prueba | history = senales del historial | velas = ultimas velas para comparar | feeds = comparar fuentes de datos | dukalive = medir retraso de Dukascopy"
+        description: "normal = revisar senales | test = mensaje de prueba | history = senales del historial | velas = ultimas velas para comparar | feeds = comparar fuentes de datos | dukalive = medir retraso de Dukascopy | histduka = senales sobre datos de Dukascopy"
         type: choice
         default: normal
         options:
@@ -16,6 +16,7 @@ on:
           - velas
           - feeds
           - dukalive
+          - histduka
 
 permissions:
   contents: write
@@ -27,7 +28,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
