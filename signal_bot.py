@@ -811,33 +811,54 @@ DUKA_DAYS = 32   # dias que baja el modo histduka
 DUKA_URL = "https://datafeed.dukascopy.com/datafeed/XAUUSD/%04d/%02d/%02d/%s_candles_min_1.bi5"
 
 
+DUKA_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "duka_cache")
+
+
 def duka_day(d, side):
-    """Baja las velas de 1 minuto de un dia (UTC) de Dukascopy. Devuelve (dict minuto->vela, nota)."""
+    """Baja las velas de 1 minuto de un dia (UTC) de Dukascopy. Devuelve (dict minuto->vela, nota).
+    Los dias ya cerrados se guardan en disco: si una corrida se corta, la siguiente continua."""
     import lzma
     import struct
-    url = DUKA_URL % (d.year, d.month - 1, d.day, side)   # el mes cuenta desde 0
-    r = None
-    err = "?"
-    for _ in range(3):
+    today = datetime.now(timezone.utc).date()
+    closed = d < today
+    cpath = os.path.join(DUKA_CACHE, "%s_%s.bi5" % (d.isoformat(), side))
+    content = None
+    if closed and os.path.exists(cpath):
+        with open(cpath, "rb") as f:
+            content = f.read()
+        if not content:
+            return {}, "sin datos (guardado)"
+    if content is None:
+        url = DUKA_URL % (d.year, d.month - 1, d.day, side)   # el mes cuenta desde 0
+        r = None
+        err = "?"
+        for _ in range(2):
+            try:
+                r = requests.get(url, timeout=(10, 40), headers={"User-Agent": "Mozilla/5.0"})
+                break
+            except requests.RequestException as e:
+                err = type(e).__name__
+                time.sleep(2)
+        if r is None:
+            return {}, "sin conexion (%s)" % err
+        global DUKA_LAST_HEADERS
         try:
-            r = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
-            break
-        except requests.RequestException as e:
-            err = type(e).__name__
-            time.sleep(3)
-    if r is None:
-        return {}, "sin conexion (%s)" % err
-    global DUKA_LAST_HEADERS
+            DUKA_LAST_HEADERS = dict(r.headers)
+        except (TypeError, ValueError, AttributeError):
+            DUKA_LAST_HEADERS = {}
+        if r.status_code != 200 or not r.content:
+            note = "HTTP %d" % r.status_code if r.status_code != 200 else "archivo vacio"
+            if closed and (today - d).days >= 3 and r.status_code in (200, 404):
+                os.makedirs(DUKA_CACHE, exist_ok=True)       # dia sin datos de verdad (fin de semana)
+                open(cpath, "wb").close()
+            return {}, note
+        content = r.content
+        if closed:
+            os.makedirs(DUKA_CACHE, exist_ok=True)
+            with open(cpath, "wb") as f:
+                f.write(content)
     try:
-        DUKA_LAST_HEADERS = dict(r.headers)
-    except (TypeError, ValueError, AttributeError):
-        DUKA_LAST_HEADERS = {}
-    if r.status_code != 200:
-        return {}, "HTTP %d" % r.status_code
-    if not r.content:
-        return {}, "archivo vacio"
-    try:
-        buf = lzma.LZMADecompressor(format=lzma.FORMAT_AUTO).decompress(r.content)
+        buf = lzma.LZMADecompressor(format=lzma.FORMAT_AUTO).decompress(content)
     except lzma.LZMAError as e:
         return {}, "no se pudo descomprimir (%s)" % e
     n = len(buf) // 24
@@ -988,11 +1009,12 @@ def print_history(groups, bars):
 
 
 def duka_bars(days_back, end_day):
-    """Velas de 15 min (precio medio) de Dukascopy de los ultimos 'days_back' dias UTC hasta end_day."""
+    """Velas de 15 min (precio medio) de Dukascopy de los ultimos 'days_back' dias UTC hasta end_day.
+    Devuelve (velas, dias_sin_nada, dias_con_un_solo_lado)."""
     from concurrent.futures import ThreadPoolExecutor
-    days = [end_day - timedelta(days=k) for k in range(days_back - 1, -1, -1)]
+    days = [end_day - timedelta(days=k) for k in range(days_back)]          # del mas nuevo al mas viejo
     jobs = [(d, side) for d in days for side in ("BID", "ASK")]
-    t_limit = time.time() + 240
+    t_limit = time.time() + 420
 
     def work(job):
         d, side = job
@@ -1001,33 +1023,93 @@ def duka_bars(days_back, end_day):
         got, note = duka_day(d, side)
         return job, got, note
 
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    with ThreadPoolExecutor(max_workers=4) as ex:
         results = list(ex.map(work, jobs))
     bid, ask = {}, {}
-    bad = []
+    status = {}
     for (d, side), got, note in results:
         (bid if side == "BID" else ask).update(got)
-        if not got and d.weekday() < 5:          # sabado y domingo sin datos es normal
-            bad.append("%s %s: %s" % (d.isoformat(), side, note))
+        status[(d, side)] = (bool(got), note)
     print("Dukascopy: %d archivos pedidos, %d velas de 1 min (BID) y %d (ASK)" % (len(jobs), len(bid), len(ask)))
-    if bad:
-        print("Archivos de dias de semana sin datos (%d):" % len(bad))
-        for b in bad[:12]:
-            print("   " + b)
+    both_missing, one_missing = [], []
+    for d in sorted(days):
+        if d.weekday() == 5:                       # sabado: sin mercado
+            continue
+        okb, nb_ = status[(d, "BID")]
+        oka, na_ = status[(d, "ASK")]
+        if not okb and not oka:
+            both_missing.append("%s (%s)" % (d.isoformat(), nb_))
+        elif not okb or not oka:
+            one_missing.append("%s sin %s" % (d.isoformat(), "BID" if not okb else "ASK"))
     buckets = sorted({m.replace(minute=(m.minute // 15) * 15) for m in set(bid) | set(ask)})
     bars = []
     for t0 in buckets:
         c = duka_candle(bid, ask, t0)
         if c:
             bars.append(dict(t=t0, o=c["o"], h=c["h"], l=c["l"], c=c["c"], v=0.0))
-    return bars
+    return bars, both_missing, one_missing
+
+
+def compare_with_td(groups_d, bars_d, since):
+    """Cuenta cuantas senales de Twelve Data coinciden con las de Dukascopy (que se parece a OANDA)."""
+    try:
+        raw = fetch_bars()
+    except SystemExit as e:
+        print("\nNo se pudo bajar Twelve Data para comparar (%s)" % e)
+        return
+    bars_t = clean_bars(raw, datetime.now(timezone.utc))
+    groups_t = merge_signals(run_engine(bars_t, v9=False), run_engine(bars_t, v9=True))
+    until = bars_d[-1]["t"] + BAR
+
+    def conf(g, bars):
+        return bars[g["i"]]["t"] + BAR
+
+    D = [(g, conf(g, bars_d)) for g in groups_d if since <= conf(g, bars_d) <= until]
+    T = [(g, conf(g, bars_t)) for g in groups_t if since <= conf(g, bars_t) <= until]
+    used = set()
+    matched = 0
+    only_d = []
+    for gd, tdt in D:
+        best = None
+        for k, (gt, tt) in enumerate(T):
+            if k in used or gt["side"] != gd["side"]:
+                continue
+            dmin = abs((tt - tdt).total_seconds()) / 60.0
+            if dmin <= 60 and (best is None or dmin < best[0]):
+                best = (dmin, k)
+        if best:
+            used.add(best[1])
+            matched += 1
+        else:
+            only_d.append((gd, tdt))
+    only_t = [T[k] for k in range(len(T)) if k not in used]
+    print()
+    print("COMPARACION desde %s hasta %s (hora Ecuador)" % (fmt_t(since), fmt_t(until)))
+    print("(misma direccion y confirmacion con menos de 1 hora de diferencia)")
+    print("  Senales con datos de Dukascopy (se parecen a OANDA): %d" % len(D))
+    print("  Twelve Data coincide en: %d" % matched)
+    print("  Solo con Dukascopy, Twelve Data NO las avisaria: %d" % len(only_d))
+    for g, t in only_d:
+        print("      %s confirmada %s" % (g["side"], fmt_t(t)))
+    print("  Solo con Twelve Data, avisos de mas: %d" % len(only_t))
+    for g, t in only_t:
+        print("      %s confirmada %s" % (g["side"], fmt_t(t)))
 
 
 def run_histduka(args):
     """Corre el motor (v8 + v9) sobre velas de Dukascopy, que se parecen casi al centavo a OANDA."""
     now = datetime.now(timezone.utc)
     end_day = now.date() - timedelta(days=1)        # ultimo dia UTC completo
-    raw = duka_bars(DUKA_DAYS, end_day)
+    raw, both_missing, one_missing = duka_bars(DUKA_DAYS, end_day)
+    if one_missing:
+        print("Dias con un solo lado (se usa el que hay, error de ~0.2): " + ", ".join(one_missing))
+    if both_missing:
+        print("\nDATOS INCOMPLETOS. Faltan dias enteros:")
+        for b in both_missing:
+            print("   " + b)
+        print("No calculo senales con huecos, porque falsean el resultado.")
+        print("Vuelve a correr 'histduka': lo ya descargado se guarda y solo pedira lo que falta.")
+        return
     if not raw:
         sys.exit("Dukascopy no devolvio velas")
     bars = clean_bars(raw, raw[-1]["t"] + BAR)
@@ -1038,6 +1120,7 @@ def run_histduka(args):
     print("(ignora las senales de los primeros 4-5 dias: el indicador necesita velas para calentarse)")
     groups = merge_signals(run_engine(bars, v9=False), run_engine(bars, v9=True))
     print_history(groups, bars)
+    compare_with_td(groups, bars, bars[0]["t"] + timedelta(days=6))
 
 
 def main():
