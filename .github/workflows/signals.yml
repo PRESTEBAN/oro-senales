@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "normal = revisar senales | test = mensaje de prueba | history = senales del historial | velas = ultimas velas para comparar | feeds = comparar fuentes de datos | dukalive = medir retraso de Dukascopy | histduka = senales sobre datos de Dukascopy"
+        description: "normal = revisar senales | test = mensaje de prueba | history = senales del historial | velas = ultimas velas para comparar | feeds = comparar fuentes de datos | dukalive = medir retraso de Dukascopy | histduka = senales sobre datos de Dukascopy | hibrido = simular bot hibrido"
         type: choice
         default: normal
         options:
@@ -17,6 +17,7 @@ on:
           - feeds
           - dukalive
           - histduka
+          - hibrido
 
 permissions:
   contents: write
@@ -40,8 +41,8 @@ jobs:
       - name: Instalar dependencias
         run: pip install -r requirements.txt
 
-      - name: Guardar descargas de Dukascopy (solo modo histduka)
-        if: ${{ github.event.inputs.mode == 'histduka' }}
+      - name: Guardar descargas de Dukascopy (modos histduka e hibrido)
+        if: ${{ github.event.inputs.mode == 'histduka' || github.event.inputs.mode == 'hibrido' }}
         uses: actions/cache@v4
         with:
           path: duka_cache
