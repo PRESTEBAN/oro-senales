@@ -1135,9 +1135,135 @@ def run_histduka(args):
     compare_with_td(groups, bars, bars[0]["t"] + timedelta(days=6))
 
 
+def _mediana(v):
+    v = sorted(v)
+    return v[len(v) // 2] if v else 0.0
+
+
+def field_offsets(td_map, bars_d, t_from, t_to):
+    """Diferencia tipica (Twelve Data - Dukascopy) por campo en las velas comunes de [t_from, t_to)."""
+    diffs = {f: [] for f in "ohlc"}
+    for b in bars_d:
+        if t_from <= b["t"] < t_to and b["t"] in td_map:
+            for f in "ohlc":
+                diffs[f].append(td_map[b["t"]][f] - b[f])
+    if len(diffs["o"]) < 50:
+        return None
+    return {f: _mediana(diffs[f]) for f in "ohlc"}
+
+
+def shift_bar(b, off):
+    nb = dict(b)
+    for f in "ohlc":
+        nb[f] = b[f] - off[f]
+    nb["h"] = max(nb["h"], nb["o"], nb["c"])
+    nb["l"] = min(nb["l"], nb["o"], nb["c"])
+    return nb
+
+
+def _match_count(ref, got):
+    """Empareja senales (lado, hora de confirmacion): mismo lado y menos de 60 min de diferencia."""
+    used = set()
+    m = 0
+    for side, t in ref:
+        best = None
+        for k, (s2, t2) in enumerate(got):
+            if k in used or s2 != side:
+                continue
+            dmin = abs((t2 - t).total_seconds()) / 60.0
+            if dmin <= 60 and (best is None or dmin < best[0]):
+                best = (dmin, k)
+        if best:
+            used.add(best[1])
+            m += 1
+    return m
+
+
+def run_hibrido(args):
+    """Simula el bot hibrido dia por dia: Dukascopy hasta el corte y Twelve Data despues.
+    Compara las senales contra las que da Dukascopy completo (que se parece a OANDA)."""
+    now = datetime.now(timezone.utc)
+    end_day = now.date() - timedelta(days=1)
+    raw_d, both_missing, one_missing = duka_bars(DUKA_DAYS, end_day)
+    if both_missing:
+        print("\nDATOS INCOMPLETOS de Dukascopy. Faltan dias enteros:")
+        for b in both_missing:
+            print("   " + b)
+        print("Vuelve a correr este modo: lo ya descargado se guarda y solo pedira lo que falta.")
+        return
+    bars_d = clean_bars(raw_d, raw_d[-1]["t"] + BAR)
+    try:
+        raw_t = fetch_bars()
+    except SystemExit as e:
+        print("No se pudo bajar Twelve Data (%s)" % e)
+        return
+    td_map = {b["t"]: b for b in raw_t}
+
+    def sigs(groups, bars):
+        return [(g["side"], bars[g["i"]]["t"] + BAR) for g in groups]
+
+    ref = sigs(merge_signals(run_engine(bars_d, v9=False), run_engine(bars_d, v9=True)), bars_d)
+    first_day = (bars_d[0]["t"] + timedelta(days=8)).date()
+    days = [first_day + timedelta(days=k) for k in range((end_day - first_day).days + 1)]
+    days = [d for d in days if d.weekday() < 5]
+    mid = lambda d: datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
+    in_day = lambda lst, d: [(sd, t) for sd, t in lst if mid(d) <= t < mid(d) + timedelta(days=1)]
+
+    # referencia total y Twelve Data solo
+    bars_t = clean_bars(raw_t, mid(end_day) + timedelta(days=1))
+    td_only = sigs(merge_signals(run_engine(bars_t, v9=False), run_engine(bars_t, v9=True)), bars_t)
+    variants = [("Twelve Data solo (el bot de hoy)", None, False),
+                ("Hibrido: Dukascopy hasta ayer", 1, False),
+                ("Hibrido: Dukascopy hasta ayer + ajuste", 1, True),
+                ("Hibrido: Dukascopy hasta anteayer", 2, False),
+                ("Hibrido: Dukascopy hasta anteayer + ajuste", 2, True)]
+    results = []
+    offs_seen = []
+    for name, lag, adjust in variants:
+        tot_ref = tot_m = tot_got = 0
+        for d in days:
+            r = in_day(ref, d)
+            if lag is None:
+                g = in_day(td_only, d)
+            else:
+                cut = mid(d) - timedelta(days=lag - 1)
+                duka_part = [b for b in bars_d if b["t"] < cut]
+                td_part = [b for b in raw_t if cut <= b["t"] < mid(d) + timedelta(days=1)]
+                if adjust:
+                    off = field_offsets(td_map, bars_d, cut - timedelta(days=4), cut)
+                    if off:
+                        td_part = [shift_bar(b, off) for b in td_part]
+                        if lag == 1:
+                            offs_seen.append(off)
+                bars_h = clean_bars(duka_part + td_part, mid(d) + timedelta(days=1))
+                gh = sigs(merge_signals(run_engine(bars_h, v9=False), run_engine(bars_h, v9=True)), bars_h)
+                g = in_day(gh, d)
+            tot_ref += len(r)
+            tot_got += len(g)
+            tot_m += _match_count(r, g)
+        results.append((name, tot_ref, tot_m, tot_got))
+    print()
+    print("SIMULACION del bot en vivo, dia por dia (lunes a viernes) desde %s hasta %s" % (days[0].isoformat(), days[-1].isoformat()))
+    print("Referencia = senales con Dukascopy completo (se parece a OANDA). Coincide = mismo lado y menos de 1 hora.")
+    print()
+    best = None
+    for name, tot_ref, tot_m, tot_got in results:
+        f1 = 2.0 * tot_m / max(1, tot_ref + tot_got)
+        if best is None or f1 > best[0]:
+            best = (f1, name)
+        print("%-46s acierta %2d de %2d | se pierde %2d | avisos de mas %2d" % (name, tot_m, tot_ref, tot_ref - tot_m, tot_got - tot_m))
+    if offs_seen:
+        avg = {f: sum(o[f] for o in offs_seen) / len(offs_seen) for f in "ohlc"}
+        print()
+        print("Ajuste tipico (Twelve Data - Dukascopy): apertura %+.2f | maximo %+.2f | minimo %+.2f | cierre %+.2f"
+              % (avg["o"], avg["h"], avg["l"], avg["c"]))
+    print()
+    print("Mejor variante: %s" % best[1])
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", default="normal", choices=["normal", "test", "history", "velas", "feeds", "dukalive", "histduka"])
+    ap.add_argument("--mode", default="normal", choices=["normal", "test", "history", "velas", "feeds", "dukalive", "histduka", "hibrido"])
     ap.add_argument("--csv", help="(pruebas) leer velas de un CSV en vez de Twelve Data")
     args = ap.parse_args()
     now = datetime.now(timezone.utc)
@@ -1157,6 +1283,10 @@ def main():
 
     if args.mode == "histduka":
         run_histduka(args)
+        return
+
+    if args.mode == "hibrido":
+        run_hibrido(args)
         return
 
     if args.mode == "normal" and not market_open(now):
