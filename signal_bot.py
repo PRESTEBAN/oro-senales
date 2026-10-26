@@ -3,16 +3,24 @@
 """
 Oro SMC v8 + v9 -> avisos por Telegram.
 Corre en GitHub Actions cada 5 minutos. Cada ejecucion:
-  1) baja ~3000 velas de XAU/USD 15m de Twelve Data,
+  1) baja las velas de 15m de XAU/USD de Capital.com (o de Twelve Data),
   2) repasa TODA la logica de los indicadores v8 y v9 vela por vela,
   3) si una de las ultimas 2 velas cerradas disparo COMPRA/VENTA (en v8, en v9
      o en ambos) y no se aviso antes, manda UN mensaje por Telegram.
 
+Fuente de datos (variable DATA_SOURCE): capital (por defecto en manual) | twelvedata
+Con Capital.com se usa el precio BID: es el que dibuja TradingView en CAPITALCOM:GOLD.
+
 Modos:  python signal_bot.py --mode normal    (el de siempre)
         python signal_bot.py --mode test      (manda un mensaje de prueba)
-        python signal_bot.py --mode history   (imprime las senales de todo el
-                                               historial, para comparar con TradingView)
-Variables (GitHub Secrets): TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, TWELVEDATA_KEY
+        python signal_bot.py --mode capital   (prueba la conexion con Capital.com e
+                                               imprime las ultimas velas; no manda nada)
+        python signal_bot.py --mode history   (senales de todo el historial descargado)
+        python signal_bot.py --mode velas     (ultimas 150 velas con sus marcas)
+Secrets: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
+         CAPITAL_API_KEY, CAPITAL_IDENTIFIER, CAPITAL_PASSWORD   (si usas Capital.com)
+         TWELVEDATA_KEY                                          (si usas Twelve Data)
+El bot SOLO LEE precios: nunca abre ordenes ni toca tu cuenta.
 """
 import argparse
 import csv
@@ -34,11 +42,24 @@ EC = ZoneInfo("America/Guayaquil")
 BAR = timedelta(minutes=15)
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
 
-SYMBOL = os.getenv("SYMBOL", "XAU/USD")
-OUTPUTSIZE = int(os.getenv("OUTPUTSIZE", "3000"))
+DATA_SOURCE = os.getenv("DATA_SOURCE", "twelvedata").strip().lower()   # capital | twelvedata
+SYMBOL = os.getenv("SYMBOL", "XAU/USD")                  # solo Twelve Data
+OUTPUTSIZE = int(os.getenv("OUTPUTSIZE", "3000"))        # solo Twelve Data
+CAPITAL_EPIC = os.getenv("CAPITAL_EPIC", "GOLD")
+CAPITAL_PRICE = os.getenv("CAPITAL_PRICE", "bid").strip().lower()   # bid | mid | ask
+CAPITAL_HOSTS = {"demo": "https://demo-api-capital.backend-capital.com",
+                 "live": "https://api-capital.backend-capital.com"}
+CAPITAL_WINDOW_DAYS = 10   # cada peticion pide 10 dias (<1000 velas de 15m, que es el maximo)
+CAPITAL_ENV_USED = ""
+
 FREQ = os.getenv("FREQ", "Equilibrado")  # Estricto | Equilibrado | Alto
 LOOKBACK_BARS = 2   # avisa si la senal ocurrio en una de las ultimas N velas cerradas
 MAX_AGE_MIN = 45    # no avisa senales mas viejas que esto (datos atrasados / reinicios)
+
+if DATA_SOURCE not in ("capital", "twelvedata"):
+    sys.exit("DATA_SOURCE debe ser capital o twelvedata")
+if CAPITAL_PRICE not in ("bid", "mid", "ask"):
+    sys.exit("CAPITAL_PRICE debe ser bid, mid o ask")
 
 PRESETS = {
     "Estricto": dict(swLen=5, intLen=3, mssWait=25, setupWait=30, chochWait=8, microLen=3,
@@ -98,12 +119,7 @@ def market_open(dt):
     return True
 
 
-def parse_rows(rows):
-    bars = []
-    for v in rows:
-        t = datetime.strptime(v["datetime"][:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-        bars.append(dict(t=t, o=float(v["open"]), h=float(v["high"]), l=float(v["low"]),
-                         c=float(v["close"]), v=float(v.get("volume") or 0)))
+def dedupe_sorted(bars):
     bars.sort(key=lambda b: b["t"])
     out = []
     for b in bars:
@@ -112,7 +128,18 @@ def parse_rows(rows):
     return out
 
 
-def fetch_bars():
+def parse_rows(rows):
+    """Filas de Twelve Data / CSV: datetime, open, high, low, close (UTC)."""
+    bars = []
+    for v in rows:
+        t = datetime.strptime(v["datetime"][:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        bars.append(dict(t=t, o=float(v["open"]), h=float(v["high"]), l=float(v["low"]),
+                         c=float(v["close"]), v=float(v.get("volume") or 0)))
+    return dedupe_sorted(bars)
+
+
+# ---------------- Twelve Data ----------------
+def fetch_twelvedata():
     key = os.getenv("TWELVEDATA_KEY")
     if not key:
         sys.exit("Falta el secret TWELVEDATA_KEY")
@@ -133,6 +160,122 @@ def fetch_bars():
     if data.get("status") == "error" or "values" not in data:
         sys.exit("Twelve Data respondio con error: %s" % data.get("message"))
     return parse_rows(data["values"])
+
+
+# ---------------- Capital.com ----------------
+def capital_session():
+    """Abre sesion (dura 10 min; se abre una por ejecucion). Devuelve (base, entorno, cabeceras)."""
+    key = os.getenv("CAPITAL_API_KEY")
+    ident = os.getenv("CAPITAL_IDENTIFIER")
+    pwd = os.getenv("CAPITAL_PASSWORD")
+    if not (key and ident and pwd):
+        sys.exit("Faltan los secrets CAPITAL_API_KEY, CAPITAL_IDENTIFIER y/o CAPITAL_PASSWORD")
+    pref = os.getenv("CAPITAL_ENV", "").strip().lower()
+    order = ["live", "demo"] if pref == "live" else ["demo", "live"]
+    last = "?"
+    for env in order:
+        base = CAPITAL_HOSTS[env]
+        for _ in range(3):
+            try:
+                r = requests.post(base + "/api/v1/session",
+                                  headers={"X-CAP-API-KEY": key, "Content-Type": "application/json"},
+                                  json={"identifier": ident, "password": pwd, "encryptedPassword": False},
+                                  timeout=30)
+            except requests.RequestException as e:
+                last = "%s en %s" % (type(e).__name__, env)
+                time.sleep(3)
+                continue
+            if r.status_code == 200 and r.headers.get("CST") and r.headers.get("X-SECURITY-TOKEN"):
+                return base, env, {"CST": r.headers["CST"], "X-SECURITY-TOKEN": r.headers["X-SECURITY-TOKEN"]}
+            last = "HTTP %d en %s: %s" % (r.status_code, env, r.text[:120])
+            if r.status_code == 429:
+                time.sleep(2)   # limite: 1 sesion por segundo
+                continue
+            break
+        time.sleep(1.2)   # entre un entorno y el otro (limite: 1 sesion por segundo)
+    sys.exit("No se pudo abrir sesion en Capital.com (%s). Revisa los 3 secrets de Capital." % last)
+
+
+def capital_px(d):
+    """Elige bid/ask/medio de un precio {'bid':..,'ask':..}."""
+    bid, ask = d.get("bid"), d.get("ask")
+    if CAPITAL_PRICE == "bid":
+        return float(bid if bid is not None else ask)
+    if CAPITAL_PRICE == "ask":
+        return float(ask if ask is not None else bid)
+    return (float(bid) + float(ask)) / 2.0
+
+
+def parse_capital(prices):
+    bars = []
+    for p in prices:
+        try:
+            t = datetime.strptime(p["snapshotTimeUTC"][:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+            bars.append(dict(t=t, o=capital_px(p["openPrice"]), h=capital_px(p["highPrice"]),
+                             l=capital_px(p["lowPrice"]), c=capital_px(p["closePrice"]),
+                             v=float(p.get("lastTradedVolume") or 0)))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return dedupe_sorted(bars)
+
+
+def fetch_capital(windows):
+    """Baja 'windows' tramos de 10 dias (el limite de la API es 1000 velas por peticion)."""
+    global CAPITAL_ENV_USED
+    base, env, hdr = capital_session()
+    CAPITAL_ENV_USED = env
+    now = datetime.now(timezone.utc)
+    fmt = "%Y-%m-%dT%H:%M:%S"
+    rows = []
+    for k in range(windows):
+        t_to = now - timedelta(days=CAPITAL_WINDOW_DAYS * k)
+        t_from = t_to - timedelta(days=CAPITAL_WINDOW_DAYS)
+        params = {"resolution": "MINUTE_15", "max": 1000, "from": t_from.strftime(fmt), "to": t_to.strftime(fmt)}
+        data = None
+        err = "?"
+        for _ in range(3):
+            try:
+                r = requests.get("%s/api/v1/prices/%s" % (base, CAPITAL_EPIC), params=params,
+                                 headers=hdr, timeout=30)
+            except requests.RequestException as e:
+                err = type(e).__name__
+                time.sleep(3)
+                continue
+            if r.status_code == 200:
+                try:
+                    data = r.json()
+                except ValueError:
+                    err = "respuesta no es JSON"
+                    continue
+                break
+            err = "HTTP %d: %s" % (r.status_code, r.text[:150])
+            if r.status_code == 429:
+                time.sleep(2)
+                continue
+            break
+        if data is None:
+            sys.exit("Capital.com no entrego velas (%s)" % err)
+        prices = data.get("prices") or []
+        if len(prices) >= 1000:
+            print("AVISO: un tramo trajo 1000 velas (el maximo); podria faltar historial.")
+        rows.extend(prices)
+        time.sleep(0.3)
+    bars = parse_capital(rows)
+    if not bars:
+        sys.exit("Capital.com respondio sin velas. Revisa CAPITAL_EPIC (ahora: %s)." % CAPITAL_EPIC)
+    return bars
+
+
+def fetch_bars(extended=False):
+    if DATA_SOURCE == "capital":
+        return fetch_capital(5 if extended else 2)
+    return fetch_twelvedata()
+
+
+def source_label():
+    if DATA_SOURCE == "capital":
+        return "Capital.com %s (%s)" % (CAPITAL_ENV_USED or "?", CAPITAL_PRICE)
+    return "Twelve Data"
 
 
 def load_csv(path):
@@ -732,7 +875,7 @@ def build_message(group, bars):
     tag = " + ".join(x["ver"] for x in items)
     close = items[0]["close"]
 
-    lines = ["%s %s %s 15m  [%s]" % (icon, side, SYMBOL, tag)]
+    lines = ["%s %s %s 15m  [%s]" % (icon, side, "XAU/USD", tag)]
     for x in items:
         modelo = "B (continuacion)" if x["model"] == "B" else "A (barrido)"
         maxs = 5 if x["model"] == "B" else 6
@@ -754,8 +897,12 @@ def build_message(group, bars):
             lines.append("%s -> SL %.2f (riesgo $%.2f) | TP 1:%g %.2f" % (x["ver"], x["sl"], risk, RR, tp))
     lines.append("Vela cerrada: %s (hora Ecuador)" % fmt_t(close_time))
     lines.append("")
-    lines.append("Precios del feed Twelve Data: pueden diferir unos dolares de TradingView. "
-                 "Confirma en tu grafico antes de operar.")
+    if DATA_SOURCE == "capital":
+        lines.append("Precios de Capital.com (%s), el mismo feed de tu grafico con fuente Capital.com. "
+                     "Confirma en tu grafico antes de operar." % CAPITAL_PRICE)
+    else:
+        lines.append("Precios del feed Twelve Data: pueden diferir unos dolares de TradingView. "
+                     "Confirma en tu grafico antes de operar.")
     return "\n".join(lines)
 
 
@@ -795,215 +942,11 @@ def save_state(state):
 
 
 # ============================================================================
-# Main
+# Modos de diagnostico
 # ============================================================================
-# ============================================================================
-# Modo feeds: compara Twelve Data y Dukascopy contra velas medidas en TradingView
-# ============================================================================
-TV_REF = [
-    # (hora UTC de apertura, apertura, maximo, minimo, cierre) medidas en TradingView (OANDA)
-    ("2026-10-22 15:00", 4059.635, 4063.105, 4053.845, 4055.010),   # 22/10 10:00 Ecuador
-    ("2026-10-22 15:15", 4055.100, 4061.150, 4051.590, 4051.840),   # 22/10 10:15 Ecuador
-    ("2026-10-23 02:00", 3992.155, 4014.140, 3986.730, 4013.170),   # 22/10 21:00 Ecuador
-]
-DUKA_LAST_HEADERS = {}
-DUKA_DAYS = 32   # dias que baja el modo histduka
-DUKA_URL = "https://datafeed.dukascopy.com/datafeed/XAUUSD/%04d/%02d/%02d/%s_candles_min_1.bi5"
-
-
-DUKA_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "duka_cache")
-
-
-def duka_day(d, side):
-    """Baja las velas de 1 minuto de un dia (UTC) de Dukascopy. Devuelve (dict minuto->vela, nota).
-    Los dias ya cerrados se guardan en disco: si una corrida se corta, la siguiente continua."""
-    import lzma
-    import struct
-    today = datetime.now(timezone.utc).date()
-    closed = d < today
-    cpath = os.path.join(DUKA_CACHE, "%s_%s.bi5" % (d.isoformat(), side))
-    content = None
-    if closed and os.path.exists(cpath):
-        with open(cpath, "rb") as f:
-            content = f.read()
-        if not content:
-            return {}, "sin datos (guardado)"
-    if content is None:
-        url = DUKA_URL % (d.year, d.month - 1, d.day, side)   # el mes cuenta desde 0
-        r = None
-        err = "?"
-        for attempt in range(3):
-            try:
-                r = requests.get(url, timeout=(30, 60), headers={"User-Agent": "Mozilla/5.0"})
-            except requests.RequestException as e:
-                r = None
-                err = type(e).__name__
-                time.sleep(3)
-                continue
-            if r.status_code in (429, 500, 502, 503, 504) and attempt < 2:
-                err = "HTTP %d" % r.status_code
-                time.sleep(6 * (attempt + 1))        # el servidor esta saturado: esperar y reintentar
-                continue
-            break
-        if r is None:
-            return {}, "sin conexion (%s)" % err
-        global DUKA_LAST_HEADERS
-        try:
-            DUKA_LAST_HEADERS = dict(r.headers)
-        except (TypeError, ValueError, AttributeError):
-            DUKA_LAST_HEADERS = {}
-        if r.status_code != 200 or not r.content:
-            note = "HTTP %d" % r.status_code if r.status_code != 200 else "archivo vacio"
-            if closed and (today - d).days >= 3 and r.status_code in (200, 404):
-                os.makedirs(DUKA_CACHE, exist_ok=True)       # dia sin datos de verdad (fin de semana)
-                open(cpath, "wb").close()
-            return {}, note
-        content = r.content
-        if closed:
-            os.makedirs(DUKA_CACHE, exist_ok=True)
-            with open(cpath, "wb") as f:
-                f.write(content)
-    try:
-        buf = lzma.LZMADecompressor(format=lzma.FORMAT_AUTO).decompress(content)
-    except lzma.LZMAError as e:
-        return {}, "no se pudo descomprimir (%s)" % e
-    n = len(buf) // 24
-    if n == 0:
-        return {}, "sin velas"
-    recs = [struct.unpack(">5If", buf[i * 24:(i + 1) * 24]) for i in range(n)]
-
-    def ok_a(x):                      # orden (apertura, cierre, minimo, maximo)
-        o, c, l, h = x[1:5]
-        return l <= min(o, c) and h >= max(o, c)
-
-    def ok_b(x):                      # orden (apertura, maximo, minimo, cierre)
-        o, h, l, c = x[1:5]
-        return l <= min(o, c) and h >= max(o, c)
-
-    na = sum(1 for x in recs if ok_a(x))
-    nb = sum(1 for x in recs if ok_b(x))
-    order = "A" if na >= nb else "B"
-    vals = sorted(x[1] for x in recs)
-    med = vals[len(vals) // 2]
-    div = next((dv for dv in (1000, 100000, 100, 10, 1) if 500 < med / dv < 20000), 1000)
-    day0 = datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
-    out = {}
-    for x in recs:
-        if order == "A":
-            o, c, l, h = [v / div for v in x[1:5]]
-        else:
-            o, h, l, c = [v / div for v in x[1:5]]
-        out[day0 + timedelta(seconds=x[0])] = dict(o=o, h=h, l=l, c=c)
-    return out, "%d velas de 1 min | orden %s (%d de %d coherentes) | divisor %d" % (n, order, max(na, nb), n, div)
-
-
-def duka_candle(bid, ask, t0, half=0.0):
-    """Arma la vela de 15 min (precio medio bid/ask, como muestra TradingView) desde las de 1 min.
-    Si de un minuto solo hay un lado, se ajusta con la mitad del spread ('half') para llegar al medio."""
-    rows = []
-    for k in range(15):
-        m = t0 + timedelta(minutes=k)
-        b, a = bid.get(m), ask.get(m)
-        if b and a:
-            rows.append({f: (b[f] + a[f]) / 2 for f in "ohlc"})
-        elif b:
-            rows.append({f: b[f] + half for f in "ohlc"})
-        elif a:
-            rows.append({f: a[f] - half for f in "ohlc"})
-    if not rows:
-        return None
-    return dict(o=rows[0]["o"], h=max(x["h"] for x in rows), l=min(x["l"] for x in rows),
-                c=rows[-1]["c"])
-
-
-def run_feeds(args):
-    raw = load_csv(args.csv) if args.csv else fetch_bars()
-    td = {b["t"]: b for b in raw}
-    refs = []
-    for hs, o, h, l, c in TV_REF:
-        t = datetime.strptime(hs, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
-        refs.append((t, dict(o=o, h=h, l=l, c=c)))
-    duka = {"BID": {}, "ASK": {}}
-    for d in sorted({t.date() for t, _ in refs}):
-        for side in ("BID", "ASK"):
-            got, note = duka_day(d, side)
-            duka[side].update(got)
-            print("Dukascopy %s %s: %s" % (side, d.isoformat(), note))
-    print()
-
-    def show(name, v):
-        print("  %-18s %10.2f %10.2f %10.2f %10.2f %8.2f" % (name, v["o"], v["h"], v["l"], v["c"], v["h"] - v["l"]))
-
-    errs = {"Twelve Data": [], "Dukascopy": []}
-    for t, tv in refs:
-        print("Vela %s (hora Ecuador) = %s UTC" % (fmt_t(t), t.strftime("%Y-%m-%d %H:%M")))
-        print("  %-18s %10s %10s %10s %10s %8s" % ("fuente", "apertura", "maximo", "minimo", "cierre", "rango"))
-        show("TradingView", tv)
-        for key, name, v in (("Twelve Data", "Twelve Data", td.get(t)),
-                             ("Dukascopy", "Dukascopy (medio)", duka_candle(duka["BID"], duka["ASK"], t))):
-            if v is None:
-                print("  %-18s sin dato para esta vela" % name)
-                continue
-            show(name, v)
-            diff = [v[f] - tv[f] for f in "ohlc"]
-            print("  %-18s %+10.2f %+10.2f %+10.2f %+10.2f" % ("   dif. vs TV", *diff))
-            errs[key].extend(abs(x) for x in diff)
-        print()
-    print("RESUMEN (diferencia media absoluta contra TradingView, en dolares):")
-    means = {}
-    for key, lst in errs.items():
-        if lst:
-            means[key] = sum(lst) / len(lst)
-            print("  %-12s %.2f  (%d valores)" % (key, means[key], len(lst)))
-        else:
-            print("  %-12s sin datos" % key)
-    if len(means) == 2:
-        best = min(means, key=means.get)
-        gap = abs(means["Twelve Data"] - means["Dukascopy"])
-        print("Mas cercano a TradingView: %s%s" % (best, " (casi empate)" if gap < 0.15 else ""))
-
-
-def run_dukalive(args):
-    """Mide que tan al dia esta el archivo de HOY de Dukascopy y compara las ultimas velas con Twelve Data."""
-    now = datetime.now(timezone.utc)
-    print("Ahora: %s UTC (%s hora Ecuador)" % (now.strftime("%Y-%m-%d %H:%M:%S"), fmt_t(now)))
-    day = now.date()
-    sides = {}
-    for side in ("BID", "ASK"):
-        got, note = duka_day(day, side)
-        sides[side] = got
-        print("Dukascopy %s %s: %s" % (side, day.isoformat(), note))
-        h = {k.lower(): v for k, v in DUKA_LAST_HEADERS.items()}
-        print("   cabeceras: last-modified=%s | date=%s | age=%s | cache-control=%s"
-              % (h.get("last-modified", "-"), h.get("date", "-"), h.get("age", "-"), h.get("cache-control", "-")))
-        if got:
-            last = max(got)
-            lag = (now - (last + timedelta(minutes=1))).total_seconds() / 60.0
-            print("   ultima vela de 1 min: %s UTC | retraso respecto a ahora: %.1f min"
-                  % (last.strftime("%Y-%m-%d %H:%M"), lag))
-    print()
-    raw = load_csv(args.csv) if args.csv else fetch_bars()
-    td = {b["t"]: b for b in raw}
-    start = now.replace(minute=(now.minute // 15) * 15, second=0, microsecond=0)
-    print("Ultimas velas de 15 min ya cerradas (Dukascopy medio contra Twelve Data):")
-    print("  %-12s %-12s %10s %10s %10s %10s" % ("hora Ecuador", "fuente", "apertura", "maximo", "minimo", "cierre"))
-    for k in range(6, 0, -1):
-        t = start - timedelta(minutes=15 * k)
-        dv = duka_candle(sides["BID"], sides["ASK"], t)
-        tv = td.get(t)
-        if dv:
-            print("  %-12s %-12s %10.2f %10.2f %10.2f %10.2f" % (fmt_t(t), "Dukascopy", dv["o"], dv["h"], dv["l"], dv["c"]))
-        else:
-            print("  %-12s %-12s sin datos de Dukascopy" % (fmt_t(t), "Dukascopy"))
-        if tv:
-            print("  %-12s %-12s %10.2f %10.2f %10.2f %10.2f" % ("", "Twelve Data", tv["o"], tv["h"], tv["l"], tv["c"]))
-        else:
-            print("  %-12s %-12s sin datos de Twelve Data" % ("", "Twelve Data"))
-
-
 def print_history(groups, bars):
     print("Senales en el historial (%d). Comparalas con las etiquetas de TradingView:" % len(groups))
-    print("(* = la senal depende del punto del perfil de volumen, que aqui se calcula sin volumen real)")
+    print("(* = la senal depende del punto del perfil de volumen)")
     for g in groups:
         x = g["items"][0]
         tags = " + ".join(y["ver"] for y in g["items"])
@@ -1017,254 +960,38 @@ def print_history(groups, bars):
                   % (d["ver"], fmt_t(bars[d["i"]]["t"] + BAR)))
 
 
-def duka_bars(days_back, end_day):
-    """Velas de 15 min (precio medio) de Dukascopy de los ultimos 'days_back' dias UTC hasta end_day.
-    Devuelve (velas, dias_sin_nada, dias_con_un_solo_lado)."""
-    from concurrent.futures import ThreadPoolExecutor
-    days = [end_day - timedelta(days=k) for k in range(days_back)]          # del mas nuevo al mas viejo
-    jobs = [(d, "BID") for d in days] + [(d, "ASK") for d in days]      # primero BID de todos los dias
-    t_limit = time.time() + 540
-
-    def work(job):
-        d, side = job
-        if time.time() > t_limit:
-            return job, {}, "omitido por tiempo"
-        got, note = duka_day(d, side)
-        return job, got, note
-
-    with ThreadPoolExecutor(max_workers=6) as ex:
-        results = list(ex.map(work, jobs))
-    bid, ask = {}, {}
-    status = {}
-    for (d, side), got, note in results:
-        (bid if side == "BID" else ask).update(got)
-        status[(d, side)] = (bool(got), note)
-    print("Dukascopy: %d archivos pedidos, %d velas de 1 min (BID) y %d (ASK)" % (len(jobs), len(bid), len(ask)))
-    both_missing, one_missing = [], []
-    for d in sorted(days):
-        if d.weekday() == 5:                       # sabado: sin mercado
-            continue
-        okb, nb_ = status[(d, "BID")]
-        oka, na_ = status[(d, "ASK")]
-        if not okb and not oka:
-            both_missing.append("%s (%s)" % (d.isoformat(), nb_))
-        elif not okb or not oka:
-            one_missing.append("%s sin %s" % (d.isoformat(), "BID" if not okb else "ASK"))
-    both = sorted(ask[m]["c"] - bid[m]["c"] for m in set(bid) & set(ask))
-    spread = both[len(both) // 2] if len(both) >= 100 and both[len(both) // 2] > 0 else 0.4
-    print("Spread medio estimado BID/ASK: %.2f (%s)" % (spread, "medido" if len(both) >= 100 else "supuesto"))
-    buckets = sorted({m.replace(minute=(m.minute // 15) * 15) for m in set(bid) | set(ask)})
-    bars = []
-    for t0 in buckets:
-        c = duka_candle(bid, ask, t0, spread / 2)
-        if c:
-            bars.append(dict(t=t0, o=c["o"], h=c["h"], l=c["l"], c=c["c"], v=0.0))
-    return bars, both_missing, one_missing
-
-
-def compare_with_td(groups_d, bars_d, since):
-    """Cuenta cuantas senales de Twelve Data coinciden con las de Dukascopy (que se parece a OANDA)."""
-    try:
-        raw = fetch_bars()
-    except SystemExit as e:
-        print("\nNo se pudo bajar Twelve Data para comparar (%s)" % e)
-        return
-    bars_t = clean_bars(raw, datetime.now(timezone.utc))
-    groups_t = merge_signals(run_engine(bars_t, v9=False), run_engine(bars_t, v9=True))
-    until = bars_d[-1]["t"] + BAR
-
-    def conf(g, bars):
-        return bars[g["i"]]["t"] + BAR
-
-    D = [(g, conf(g, bars_d)) for g in groups_d if since <= conf(g, bars_d) <= until]
-    T = [(g, conf(g, bars_t)) for g in groups_t if since <= conf(g, bars_t) <= until]
-    used = set()
-    matched = 0
-    only_d = []
-    for gd, tdt in D:
-        best = None
-        for k, (gt, tt) in enumerate(T):
-            if k in used or gt["side"] != gd["side"]:
-                continue
-            dmin = abs((tt - tdt).total_seconds()) / 60.0
-            if dmin <= 60 and (best is None or dmin < best[0]):
-                best = (dmin, k)
-        if best:
-            used.add(best[1])
-            matched += 1
-        else:
-            only_d.append((gd, tdt))
-    only_t = [T[k] for k in range(len(T)) if k not in used]
-    print()
-    print("COMPARACION desde %s hasta %s (hora Ecuador)" % (fmt_t(since), fmt_t(until)))
-    print("(misma direccion y confirmacion con menos de 1 hora de diferencia)")
-    print("  Senales con datos de Dukascopy (se parecen a OANDA): %d" % len(D))
-    print("  Twelve Data coincide en: %d" % matched)
-    print("  Solo con Dukascopy, Twelve Data NO las avisaria: %d" % len(only_d))
-    for g, t in only_d:
-        print("      %s confirmada %s" % (g["side"], fmt_t(t)))
-    print("  Solo con Twelve Data, avisos de mas: %d" % len(only_t))
-    for g, t in only_t:
-        print("      %s confirmada %s" % (g["side"], fmt_t(t)))
-
-
-def run_histduka(args):
-    """Corre el motor (v8 + v9) sobre velas de Dukascopy, que se parecen casi al centavo a OANDA."""
+def run_capital_check():
+    """Prueba la conexion con Capital.com: abre sesion, baja velas e imprime las ultimas."""
+    if DATA_SOURCE != "capital":
+        sys.exit("Este modo prueba Capital.com: pon DATA_SOURCE=capital")
+    raw = fetch_capital(1)
     now = datetime.now(timezone.utc)
-    end_day = now.date() - timedelta(days=1)        # ultimo dia UTC completo
-    raw, both_missing, one_missing = duka_bars(DUKA_DAYS, end_day)
-    if one_missing:
-        print("Dias con un solo lado (se ajusta con la mitad del spread): " + ", ".join(one_missing))
-    if both_missing:
-        print("\nDATOS INCOMPLETOS. Faltan dias enteros:")
-        for b in both_missing:
-            print("   " + b)
-        print("No calculo senales con huecos, porque falsean el resultado.")
-        print("Vuelve a correr 'histduka': lo ya descargado se guarda y solo pedira lo que falta.")
+    print("Sesion abierta en Capital.com (%s) | epic %s | precio %s | velas recibidas: %d"
+          % (CAPITAL_ENV_USED, CAPITAL_EPIC, CAPITAL_PRICE, len(raw)))
+    print("Primera vela: %s | ultima vela recibida: %s (hora Ecuador)" % (fmt_t(raw[0]["t"]), fmt_t(raw[-1]["t"])))
+    print("Ahora: %s (hora Ecuador)" % fmt_t(now))
+    bars = clean_bars(raw, now)
+    if not bars:
+        print("No hay velas cerradas con mercado abierto (fin de semana?).")
         return
-    if not raw:
-        sys.exit("Dukascopy no devolvio velas")
-    bars = clean_bars(raw, raw[-1]["t"] + BAR)
-    print("Velas de 15 min: %d | desde %s hasta %s (hora Ecuador) | modo %s"
-          % (len(bars), fmt_t(bars[0]["t"]), fmt_t(bars[-1]["t"] + BAR), FREQ))
-    if len(bars) < 300:
-        sys.exit("Muy pocas velas utiles (%d)" % len(bars))
-    print("(ignora las senales de los primeros 4-5 dias: el indicador necesita velas para calentarse)")
-    groups = merge_signals(run_engine(bars, v9=False), run_engine(bars, v9=True))
-    print_history(groups, bars)
-    compare_with_td(groups, bars, bars[0]["t"] + timedelta(days=6))
-
-
-def _mediana(v):
-    v = sorted(v)
-    return v[len(v) // 2] if v else 0.0
-
-
-def field_offsets(td_map, bars_d, t_from, t_to):
-    """Diferencia tipica (Twelve Data - Dukascopy) por campo en las velas comunes de [t_from, t_to)."""
-    diffs = {f: [] for f in "ohlc"}
-    for b in bars_d:
-        if t_from <= b["t"] < t_to and b["t"] in td_map:
-            for f in "ohlc":
-                diffs[f].append(td_map[b["t"]][f] - b[f])
-    if len(diffs["o"]) < 50:
-        return None
-    return {f: _mediana(diffs[f]) for f in "ohlc"}
-
-
-def shift_bar(b, off):
-    nb = dict(b)
-    for f in "ohlc":
-        nb[f] = b[f] - off[f]
-    nb["h"] = max(nb["h"], nb["o"], nb["c"])
-    nb["l"] = min(nb["l"], nb["o"], nb["c"])
-    return nb
-
-
-def _match_count(ref, got):
-    """Empareja senales (lado, hora de confirmacion): mismo lado y menos de 60 min de diferencia."""
-    used = set()
-    m = 0
-    for side, t in ref:
-        best = None
-        for k, (s2, t2) in enumerate(got):
-            if k in used or s2 != side:
-                continue
-            dmin = abs((t2 - t).total_seconds()) / 60.0
-            if dmin <= 60 and (best is None or dmin < best[0]):
-                best = (dmin, k)
-        if best:
-            used.add(best[1])
-            m += 1
-    return m
-
-
-def run_hibrido(args):
-    """Simula el bot hibrido dia por dia: Dukascopy hasta el corte y Twelve Data despues.
-    Compara las senales contra las que da Dukascopy completo (que se parece a OANDA)."""
-    now = datetime.now(timezone.utc)
-    end_day = now.date() - timedelta(days=1)
-    raw_d, both_missing, one_missing = duka_bars(DUKA_DAYS, end_day)
-    if both_missing:
-        print("\nDATOS INCOMPLETOS de Dukascopy. Faltan dias enteros:")
-        for b in both_missing:
-            print("   " + b)
-        print("Vuelve a correr este modo: lo ya descargado se guarda y solo pedira lo que falta.")
-        return
-    bars_d = clean_bars(raw_d, raw_d[-1]["t"] + BAR)
-    try:
-        raw_t = fetch_bars()
-    except SystemExit as e:
-        print("No se pudo bajar Twelve Data (%s)" % e)
-        return
-    td_map = {b["t"]: b for b in raw_t}
-
-    def sigs(groups, bars):
-        return [(g["side"], bars[g["i"]]["t"] + BAR) for g in groups]
-
-    ref = sigs(merge_signals(run_engine(bars_d, v9=False), run_engine(bars_d, v9=True)), bars_d)
-    first_day = (bars_d[0]["t"] + timedelta(days=8)).date()
-    days = [first_day + timedelta(days=k) for k in range((end_day - first_day).days + 1)]
-    days = [d for d in days if d.weekday() < 5]
-    mid = lambda d: datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
-    in_day = lambda lst, d: [(sd, t) for sd, t in lst if mid(d) <= t < mid(d) + timedelta(days=1)]
-
-    # referencia total y Twelve Data solo
-    bars_t = clean_bars(raw_t, mid(end_day) + timedelta(days=1))
-    td_only = sigs(merge_signals(run_engine(bars_t, v9=False), run_engine(bars_t, v9=True)), bars_t)
-    variants = [("Twelve Data solo (el bot de hoy)", None, False),
-                ("Hibrido: Dukascopy hasta ayer", 1, False),
-                ("Hibrido: Dukascopy hasta ayer + ajuste", 1, True),
-                ("Hibrido: Dukascopy hasta anteayer", 2, False),
-                ("Hibrido: Dukascopy hasta anteayer + ajuste", 2, True)]
-    results = []
-    offs_seen = []
-    for name, lag, adjust in variants:
-        tot_ref = tot_m = tot_got = 0
-        for d in days:
-            r = in_day(ref, d)
-            if lag is None:
-                g = in_day(td_only, d)
-            else:
-                cut = mid(d) - timedelta(days=lag - 1)
-                duka_part = [b for b in bars_d if b["t"] < cut]
-                td_part = [b for b in raw_t if cut <= b["t"] < mid(d) + timedelta(days=1)]
-                if adjust:
-                    off = field_offsets(td_map, bars_d, cut - timedelta(days=4), cut)
-                    if off:
-                        td_part = [shift_bar(b, off) for b in td_part]
-                        if lag == 1:
-                            offs_seen.append(off)
-                bars_h = clean_bars(duka_part + td_part, mid(d) + timedelta(days=1))
-                gh = sigs(merge_signals(run_engine(bars_h, v9=False), run_engine(bars_h, v9=True)), bars_h)
-                g = in_day(gh, d)
-            tot_ref += len(r)
-            tot_got += len(g)
-            tot_m += _match_count(r, g)
-        results.append((name, tot_ref, tot_m, tot_got))
+    gaps = [(bars[k]["t"] - bars[k - 1]["t"]).total_seconds() / 60 for k in range(1, len(bars))]
+    print("Cierres de mercado dentro del historial (huecos de mas de 60 min): %d" % sum(1 for g in gaps if g > 60))
     print()
-    print("SIMULACION del bot en vivo, dia por dia (lunes a viernes) desde %s hasta %s" % (days[0].isoformat(), days[-1].isoformat()))
-    print("Referencia = senales con Dukascopy completo (se parece a OANDA). Coincide = mismo lado y menos de 1 hora.")
+    print("Ultimas 12 velas cerradas, hora de APERTURA (hora Ecuador, igual que TradingView):")
+    print("hora         |   apertura    maximo     minimo     cierre")
+    for b in bars[-12:]:
+        print("%s | %10.2f %10.2f %10.2f %10.2f" % (fmt_t(b["t"]), b["o"], b["h"], b["l"], b["c"]))
     print()
-    best = None
-    for name, tot_ref, tot_m, tot_got in results:
-        f1 = 2.0 * tot_m / max(1, tot_ref + tot_got)
-        if best is None or f1 > best[0]:
-            best = (f1, name)
-        print("%-46s acierta %2d de %2d | se pierde %2d | avisos de mas %2d" % (name, tot_m, tot_ref, tot_ref - tot_m, tot_got - tot_m))
-    if offs_seen:
-        avg = {f: sum(o[f] for o in offs_seen) / len(offs_seen) for f in "ohlc"}
-        print()
-        print("Ajuste tipico (Twelve Data - Dukascopy): apertura %+.2f | maximo %+.2f | minimo %+.2f | cierre %+.2f"
-              % (avg["o"], avg["h"], avg["l"], avg["c"]))
-    print()
-    print("Mejor variante: %s" % best[1])
+    print("Compara 2 o 3 de estas velas con las de tu grafico (pasa el mouse sobre la vela en TradingView).")
 
 
+# ============================================================================
+# Main
+# ============================================================================
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", default="normal", choices=["normal", "test", "history", "velas", "feeds", "dukalive", "histduka", "hibrido"])
-    ap.add_argument("--csv", help="(pruebas) leer velas de un CSV en vez de Twelve Data")
+    ap.add_argument("--mode", default="normal", choices=["normal", "test", "history", "velas", "capital"])
+    ap.add_argument("--csv", help="(pruebas) leer velas de un CSV en vez de la API")
     args = ap.parse_args()
     now = datetime.now(timezone.utc)
 
@@ -1273,27 +1000,16 @@ def main():
         print("Mensaje de prueba enviado" if ok else "No se pudo enviar el mensaje de prueba")
         sys.exit(0 if ok else 1)
 
-    if args.mode == "feeds":
-        run_feeds(args)
-        return
-
-    if args.mode == "dukalive":
-        run_dukalive(args)
-        return
-
-    if args.mode == "histduka":
-        run_histduka(args)
-        return
-
-    if args.mode == "hibrido":
-        run_hibrido(args)
+    if args.mode == "capital":
+        run_capital_check()
         return
 
     if args.mode == "normal" and not market_open(now):
         print("Mercado cerrado, nada que revisar.")
         return
 
-    raw = load_csv(args.csv) if args.csv else fetch_bars()
+    extended = args.mode in ("history", "velas")
+    raw = load_csv(args.csv) if args.csv else fetch_bars(extended)
     if args.csv and raw:
         now = raw[-1]["t"] + timedelta(days=1)
     bars = clean_bars(raw, now)
@@ -1301,13 +1017,14 @@ def main():
         sys.exit("Muy pocas velas utiles (%d). Revisa el feed." % len(bars))
     last_close_time = bars[-1]["t"] + BAR
     age_last = (now - last_close_time).total_seconds() / 60.0
-    print("Velas: %d | ultima cerrada: %s UTC | ahora: %s UTC | atraso del feed: %.0f min | modo %s"
-          % (len(bars), last_close_time.strftime("%Y-%m-%d %H:%M"),
+    print("Fuente: %s | velas: %d | ultima cerrada: %s UTC | ahora: %s UTC | atraso del feed: %.0f min | modo %s"
+          % (source_label(), len(bars), last_close_time.strftime("%Y-%m-%d %H:%M"),
              now.strftime("%Y-%m-%d %H:%M"), age_last, FREQ))
 
     groups = merge_signals(run_engine(bars, v9=False), run_engine(bars, v9=True))
 
     if args.mode == "history":
+        print("(ignora las senales de los primeros dias: el indicador necesita velas para calentarse)")
         print_history(groups, bars)
         return
 
@@ -1322,7 +1039,7 @@ def main():
             marks.setdefault(g["i"], []).append("aviso %s" % g["side"])
         last = bars[-VELAS_N:]
         first_i = len(bars) - len(last)
-        print("Ultimas %d velas de %s (15m), hora de apertura = hora Ecuador (UTC-5):" % (len(last), SYMBOL))
+        print("Ultimas %d velas (15m), hora de apertura = hora Ecuador (UTC-5):" % len(last))
         print("hora         |   apertura    maximo     minimo     cierre | marcas")
         for k, b in enumerate(last):
             m = ", ".join(marks.get(first_i + k, []))
