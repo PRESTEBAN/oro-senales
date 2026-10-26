@@ -832,13 +832,19 @@ def duka_day(d, side):
         url = DUKA_URL % (d.year, d.month - 1, d.day, side)   # el mes cuenta desde 0
         r = None
         err = "?"
-        for _ in range(2):
+        for attempt in range(3):
             try:
-                r = requests.get(url, timeout=(10, 40), headers={"User-Agent": "Mozilla/5.0"})
-                break
+                r = requests.get(url, timeout=(30, 60), headers={"User-Agent": "Mozilla/5.0"})
             except requests.RequestException as e:
+                r = None
                 err = type(e).__name__
-                time.sleep(2)
+                time.sleep(3)
+                continue
+            if r.status_code in (429, 500, 502, 503, 504) and attempt < 2:
+                err = "HTTP %d" % r.status_code
+                time.sleep(6 * (attempt + 1))        # el servidor esta saturado: esperar y reintentar
+                continue
+            break
         if r is None:
             return {}, "sin conexion (%s)" % err
         global DUKA_LAST_HEADERS
@@ -891,16 +897,19 @@ def duka_day(d, side):
     return out, "%d velas de 1 min | orden %s (%d de %d coherentes) | divisor %d" % (n, order, max(na, nb), n, div)
 
 
-def duka_candle(bid, ask, t0):
-    """Arma la vela de 15 min (precio medio bid/ask, como muestra TradingView) desde las de 1 min."""
+def duka_candle(bid, ask, t0, half=0.0):
+    """Arma la vela de 15 min (precio medio bid/ask, como muestra TradingView) desde las de 1 min.
+    Si de un minuto solo hay un lado, se ajusta con la mitad del spread ('half') para llegar al medio."""
     rows = []
     for k in range(15):
         m = t0 + timedelta(minutes=k)
         b, a = bid.get(m), ask.get(m)
         if b and a:
             rows.append({f: (b[f] + a[f]) / 2 for f in "ohlc"})
-        elif b or a:
-            rows.append(dict(b or a))
+        elif b:
+            rows.append({f: b[f] + half for f in "ohlc"})
+        elif a:
+            rows.append({f: a[f] - half for f in "ohlc"})
     if not rows:
         return None
     return dict(o=rows[0]["o"], h=max(x["h"] for x in rows), l=min(x["l"] for x in rows),
@@ -1013,8 +1022,8 @@ def duka_bars(days_back, end_day):
     Devuelve (velas, dias_sin_nada, dias_con_un_solo_lado)."""
     from concurrent.futures import ThreadPoolExecutor
     days = [end_day - timedelta(days=k) for k in range(days_back)]          # del mas nuevo al mas viejo
-    jobs = [(d, side) for d in days for side in ("BID", "ASK")]
-    t_limit = time.time() + 420
+    jobs = [(d, "BID") for d in days] + [(d, "ASK") for d in days]      # primero BID de todos los dias
+    t_limit = time.time() + 540
 
     def work(job):
         d, side = job
@@ -1023,7 +1032,7 @@ def duka_bars(days_back, end_day):
         got, note = duka_day(d, side)
         return job, got, note
 
-    with ThreadPoolExecutor(max_workers=4) as ex:
+    with ThreadPoolExecutor(max_workers=6) as ex:
         results = list(ex.map(work, jobs))
     bid, ask = {}, {}
     status = {}
@@ -1041,10 +1050,13 @@ def duka_bars(days_back, end_day):
             both_missing.append("%s (%s)" % (d.isoformat(), nb_))
         elif not okb or not oka:
             one_missing.append("%s sin %s" % (d.isoformat(), "BID" if not okb else "ASK"))
+    both = sorted(ask[m]["c"] - bid[m]["c"] for m in set(bid) & set(ask))
+    spread = both[len(both) // 2] if len(both) >= 100 and both[len(both) // 2] > 0 else 0.4
+    print("Spread medio estimado BID/ASK: %.2f (%s)" % (spread, "medido" if len(both) >= 100 else "supuesto"))
     buckets = sorted({m.replace(minute=(m.minute // 15) * 15) for m in set(bid) | set(ask)})
     bars = []
     for t0 in buckets:
-        c = duka_candle(bid, ask, t0)
+        c = duka_candle(bid, ask, t0, spread / 2)
         if c:
             bars.append(dict(t=t0, o=c["o"], h=c["h"], l=c["l"], c=c["c"], v=0.0))
     return bars, both_missing, one_missing
@@ -1102,7 +1114,7 @@ def run_histduka(args):
     end_day = now.date() - timedelta(days=1)        # ultimo dia UTC completo
     raw, both_missing, one_missing = duka_bars(DUKA_DAYS, end_day)
     if one_missing:
-        print("Dias con un solo lado (se usa el que hay, error de ~0.2): " + ", ".join(one_missing))
+        print("Dias con un solo lado (se ajusta con la mitad del spread): " + ", ".join(one_missing))
     if both_missing:
         print("\nDATOS INCOMPLETOS. Faltan dias enteros:")
         for b in both_missing:
