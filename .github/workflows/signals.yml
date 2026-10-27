@@ -1,8 +1,8 @@
 name: Senales oro
 
 on:
-  schedule:
-    - cron: "*/5 * * * *"
+ # schedule:
+   # - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       mode:
