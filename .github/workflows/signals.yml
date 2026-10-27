@@ -22,6 +22,14 @@ on:
         options:
           - capital
           - twelvedata
+      tf:
+        description: "Temporalidad para capital / velas / history (en minutos: 15 = M15, 30 = M30, 60 = H1). El modo normal revisa las tres."
+        type: choice
+        default: "15"
+        options:
+          - "15"
+          - "30"
+          - "60"
 
 permissions:
   contents: write
@@ -55,8 +63,10 @@ jobs:
           CAPITAL_PASSWORD: ${{ secrets.CAPITAL_PASSWORD }}
           CAPITAL_ENV: ${{ vars.CAPITAL_ENV }}
           DATA_SOURCE: ${{ github.event.inputs.source || vars.DATA_SOURCE || 'twelvedata' }}
+          TIMEFRAMES: ${{ vars.TIMEFRAMES || '15,30,60' }}
           MODE: ${{ github.event.inputs.mode || 'normal' }}
-        run: python signal_bot.py --mode "$MODE"
+          TF: ${{ github.event.inputs.tf || '15' }}
+        run: python signal_bot.py --mode "$MODE" --tf "$TF"
 
       - name: Guardar estado
         run: |
