@@ -64,6 +64,7 @@ jobs:
           CAPITAL_ENV: ${{ vars.CAPITAL_ENV }}
           DATA_SOURCE: ${{ github.event.inputs.source || vars.DATA_SOURCE || 'twelvedata' }}
           TIMEFRAMES: ${{ vars.TIMEFRAMES || '15,30,60' }}
+          CLOSE_MARGIN_S: ${{ vars.CLOSE_MARGIN_S || '3' }}
           MODE: ${{ github.event.inputs.mode || 'normal' }}
           TF: ${{ github.event.inputs.tf || '15' }}
         run: python signal_bot.py --mode "$MODE" --tf "$TF"
