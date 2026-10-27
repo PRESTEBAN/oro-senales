@@ -2,11 +2,15 @@
 # -*- coding: utf-8 -*-
 """
 Oro SMC v8 + v9 -> avisos por Telegram en M15, M30 y H1.
-Corre en GitHub Actions cada 5 minutos. Cada ejecucion, para cada temporalidad:
+Corre en GitHub Actions, disparado desde cron-job.org. Cada ejecucion, para cada temporalidad:
   1) baja las velas de XAU/USD de Capital.com (o de Twelve Data),
   2) repasa TODA la logica de los indicadores v8 y v9 vela por vela,
   3) si una de las ultimas 2 velas cerradas disparo COMPRA/VENTA (en v8, en v9
      o en ambos) y no se aviso antes, manda UN mensaje por Telegram.
+
+AVISO LO MAS RAPIDO POSIBLE: si la ejecucion arranca poco antes del cierre de una vela de 15 min
+(por ejemplo disparada en el minuto :14, :29, :44 o :59), el bot ESPERA al cierre + unos segundos
+de margen y revisa en ese instante. Asi el tiempo de arranque de GitHub no cuenta en el retraso.
 
 Temporalidades (variable TIMEFRAMES, por defecto "15,30,60"): M15, M30 y H1.
 Tu Pine usa la misma temporalidad superior (4H) en M15, M30 y H1, asi que el motor es el mismo.
@@ -95,6 +99,10 @@ FREQ = os.getenv("FREQ", "Equilibrado")  # Estricto | Equilibrado | Alto
 LOOKBACK_BARS = 2   # avisa si la senal ocurrio en una de las ultimas N velas cerradas
 MAX_AGE_MIN = 45    # no avisa senales mas viejas que esto (datos atrasados / reinicios)
 
+# Espera al cierre de la vela (modo normal)
+CLOSE_MARGIN_S = float(os.getenv("CLOSE_MARGIN_S", "3"))   # segundos tras el cierre, para que la vela quede final
+MAX_WAIT_S = float(os.getenv("MAX_WAIT_S", "100"))         # solo espera si el cierre esta a menos de esto
+
 if DATA_SOURCE not in ("capital", "twelvedata"):
     sys.exit("DATA_SOURCE debe ser capital o twelvedata")
 if CAPITAL_PRICE not in ("bid", "mid", "ask"):
@@ -156,6 +164,28 @@ def market_open(dt):
     if wd == 6 and loc.hour < 17:
         return False
     return True
+
+
+def wait_for_close(now):
+    """Si el cierre de una vela de 15 min esta cerca (o acaba de pasar), espera hasta
+    cierre + CLOSE_MARGIN_S y devuelve la hora actual. Todos los cierres de M30 y H1
+    caen en cierres de M15, asi que basta con mirar la rejilla de 15 minutos."""
+    step = 15 * 60
+    ts = now.timestamp()
+    next_close = (math.floor(ts / step) + 1) * step
+    last_close = next_close - step
+    sleep_s = 0.0
+    if next_close - ts <= MAX_WAIT_S:
+        sleep_s = (next_close - ts) + CLOSE_MARGIN_S
+        print("Faltan %.0f s para el cierre de las %s UTC: espero %.0f s y reviso justo despues."
+              % (next_close - ts, datetime.fromtimestamp(next_close, timezone.utc).strftime("%H:%M"), sleep_s))
+    elif ts - last_close < CLOSE_MARGIN_S:
+        sleep_s = CLOSE_MARGIN_S - (ts - last_close)
+        print("La vela acaba de cerrar: espero %.1f s para que quede final." % sleep_s)
+    if sleep_s > 0:
+        time.sleep(sleep_s)
+        return datetime.now(timezone.utc)
+    return now
 
 
 def dedupe_sorted(bars):
@@ -1079,7 +1109,7 @@ def check_timeframe(tf, now, state, raw=None):
         if send_telegram(build_message(s, bars)):
             state["sent"].append(key)
             changed = True
-            print("[%s] Aviso enviado: %s" % (name, key))
+            print("[%s] Aviso enviado: %s (%.1f min despues del cierre de la vela)" % (name, key, age))
     return changed
 
 
@@ -1106,11 +1136,14 @@ def main():
         return
 
     if args.mode == "normal":
-        if not market_open(now) and not args.csv:
-            print("Mercado cerrado, nada que revisar.")
-            return
+        if not args.csv:
+            now = wait_for_close(now)                       # si el cierre esta cerca, espera al cierre
+            # se mira 1 minuto atras para no saltarse la ultima vela antes del cierre semanal
+            if not market_open(now - timedelta(minutes=1)):
+                print("Mercado cerrado, nada que revisar.")
+                return
         state = load_state()
-        if args.csv:                                   # (pruebas) una sola temporalidad desde CSV
+        if args.csv:                                        # (pruebas) una sola temporalidad desde CSV
             if check_timeframe(args.tf, now, state, raw=load_csv(args.csv)):
                 save_state(state)
             return
@@ -1119,7 +1152,7 @@ def main():
         for tf in TIMEFRAMES:
             try:
                 if check_timeframe(tf, now, state):
-                    save_state(state)                  # se guarda ya, por si falla la siguiente
+                    save_state(state)                       # se guarda ya, por si falla la siguiente
                 ok_count += 1
             except SystemExit as e:
                 msg = str(e.code) if e.code is not None else "error"
