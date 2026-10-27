@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Oro SMC v8 + v9 -> avisos por Telegram.
-Corre en GitHub Actions cada 5 minutos. Cada ejecucion:
-  1) baja las velas de 15m de XAU/USD de Capital.com (o de Twelve Data),
+Oro SMC v8 + v9 -> avisos por Telegram en M15, M30 y H1.
+Corre en GitHub Actions cada 5 minutos. Cada ejecucion, para cada temporalidad:
+  1) baja las velas de XAU/USD de Capital.com (o de Twelve Data),
   2) repasa TODA la logica de los indicadores v8 y v9 vela por vela,
   3) si una de las ultimas 2 velas cerradas disparo COMPRA/VENTA (en v8, en v9
      o en ambos) y no se aviso antes, manda UN mensaje por Telegram.
 
-Fuente de datos (variable DATA_SOURCE): capital (por defecto en manual) | twelvedata
+Temporalidades (variable TIMEFRAMES, por defecto "15,30,60"): M15, M30 y H1.
+Tu Pine usa la misma temporalidad superior (4H) en M15, M30 y H1, asi que el motor es el mismo.
+Fuente de datos (variable DATA_SOURCE): capital | twelvedata
 Con Capital.com se usa el precio BID: es el que dibuja TradingView en CAPITALCOM:GOLD.
 
-Modos:  python signal_bot.py --mode normal    (el de siempre)
+Modos:  python signal_bot.py --mode normal    (el de siempre: revisa todas las temporalidades)
         python signal_bot.py --mode test      (manda un mensaje de prueba)
-        python signal_bot.py --mode capital   (prueba la conexion con Capital.com e
-                                               imprime las ultimas velas; no manda nada)
-        python signal_bot.py --mode history   (senales de todo el historial descargado)
-        python signal_bot.py --mode velas     (ultimas 150 velas con sus marcas)
+        python signal_bot.py --mode capital   [--tf 15|30|60]  (prueba la conexion e imprime velas)
+        python signal_bot.py --mode history   [--tf 15|30|60]  (senales del historial descargado)
+        python signal_bot.py --mode velas     [--tf 15|30|60]  (ultimas 150 velas con sus marcas)
 Secrets: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
          CAPITAL_API_KEY, CAPITAL_IDENTIFIER, CAPITAL_PASSWORD   (si usas Capital.com)
          TWELVEDATA_KEY                                          (si usas Twelve Data)
@@ -39,8 +40,44 @@ import requests
 # ============================================================================
 NY = ZoneInfo("America/New_York")
 EC = ZoneInfo("America/Guayaquil")
-BAR = timedelta(minutes=15)
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
+
+# Temporalidades soportadas. 'days' = tamano de cada peticion a Capital.com (maximo 1000 velas).
+TF_INFO = {
+    15: dict(name="M15", label="15m", res="MINUTE_15", td="15min", days=10),
+    30: dict(name="M30", label="30m", res="MINUTE_30", td="30min", days=20),
+    60: dict(name="H1", label="1h", res="HOUR", td="1h", days=40),
+}
+BAR = timedelta(minutes=15)    # duracion de la vela en uso; la cambia set_tf()
+TF = 15
+
+
+def set_tf(minutes):
+    """Cambia la temporalidad con la que trabajan clean_bars, los mensajes y los modos."""
+    global BAR, TF
+    TF = minutes
+    BAR = timedelta(minutes=minutes)
+
+
+def tf_name():
+    return TF_INFO[TF]["name"]
+
+
+def parse_timeframes(text):
+    out = []
+    for x in text.replace(" ", "").split(","):
+        if not x:
+            continue
+        if not x.isdigit() or int(x) not in TF_INFO:
+            sys.exit("TIMEFRAMES solo admite 15, 30 y 60 (separados por coma). Recibi: %s" % text)
+        if int(x) not in out:
+            out.append(int(x))
+    if not out:
+        sys.exit("TIMEFRAMES esta vacio")
+    return out
+
+
+TIMEFRAMES = parse_timeframes(os.getenv("TIMEFRAMES", "15,30,60"))
 
 DATA_SOURCE = os.getenv("DATA_SOURCE", "twelvedata").strip().lower()   # capital | twelvedata
 SYMBOL = os.getenv("SYMBOL", "XAU/USD")                  # solo Twelve Data
@@ -49,8 +86,10 @@ CAPITAL_EPIC = os.getenv("CAPITAL_EPIC", "GOLD")
 CAPITAL_PRICE = os.getenv("CAPITAL_PRICE", "bid").strip().lower()   # bid | mid | ask
 CAPITAL_HOSTS = {"demo": "https://demo-api-capital.backend-capital.com",
                  "live": "https://api-capital.backend-capital.com"}
-CAPITAL_WINDOW_DAYS = 10   # cada peticion pide 10 dias (<1000 velas de 15m, que es el maximo)
 CAPITAL_ENV_USED = ""
+_CAPITAL_SESSION = None    # (base, entorno, cabeceras): se abre una sola vez por ejecucion
+WINDOWS_NORMAL = 2         # tramos que se piden en el modo normal (por temporalidad)
+WINDOWS_EXTENDED = 5       # tramos en los modos history / velas
 
 FREQ = os.getenv("FREQ", "Equilibrado")  # Estricto | Equilibrado | Alto
 LOOKBACK_BARS = 2   # avisa si la senal ocurrio en una de las ultimas N velas cerradas
@@ -139,11 +178,11 @@ def parse_rows(rows):
 
 
 # ---------------- Twelve Data ----------------
-def fetch_twelvedata():
+def fetch_twelvedata(tf):
     key = os.getenv("TWELVEDATA_KEY")
     if not key:
         sys.exit("Falta el secret TWELVEDATA_KEY")
-    params = dict(symbol=SYMBOL, interval="15min", outputsize=OUTPUTSIZE, order="ASC",
+    params = dict(symbol=SYMBOL, interval=TF_INFO[tf]["td"], outputsize=OUTPUTSIZE, order="ASC",
                   timezone="UTC", apikey=key)
     last_err = None
     data = None
@@ -164,7 +203,11 @@ def fetch_twelvedata():
 
 # ---------------- Capital.com ----------------
 def capital_session():
-    """Abre sesion (dura 10 min; se abre una por ejecucion). Devuelve (base, entorno, cabeceras)."""
+    """Abre sesion (dura 10 min de inactividad). Se abre UNA vez por ejecucion y se reutiliza
+    en las tres temporalidades. Devuelve (base, entorno, cabeceras)."""
+    global _CAPITAL_SESSION
+    if _CAPITAL_SESSION:
+        return _CAPITAL_SESSION
     key = os.getenv("CAPITAL_API_KEY")
     ident = os.getenv("CAPITAL_IDENTIFIER")
     pwd = os.getenv("CAPITAL_PASSWORD")
@@ -186,7 +229,9 @@ def capital_session():
                 time.sleep(3)
                 continue
             if r.status_code == 200 and r.headers.get("CST") and r.headers.get("X-SECURITY-TOKEN"):
-                return base, env, {"CST": r.headers["CST"], "X-SECURITY-TOKEN": r.headers["X-SECURITY-TOKEN"]}
+                _CAPITAL_SESSION = (base, env, {"CST": r.headers["CST"],
+                                                "X-SECURITY-TOKEN": r.headers["X-SECURITY-TOKEN"]})
+                return _CAPITAL_SESSION
             last = "HTTP %d en %s: %s" % (r.status_code, env, r.text[:120])
             if r.status_code == 429:
                 time.sleep(2)   # limite: 1 sesion por segundo
@@ -219,18 +264,19 @@ def parse_capital(prices):
     return dedupe_sorted(bars)
 
 
-def fetch_capital(windows):
-    """Baja 'windows' tramos de 10 dias (el limite de la API es 1000 velas por peticion)."""
+def fetch_capital(tf, windows):
+    """Baja 'windows' tramos (el limite de la API es 1000 velas por peticion) de la temporalidad tf."""
     global CAPITAL_ENV_USED
     base, env, hdr = capital_session()
     CAPITAL_ENV_USED = env
+    info = TF_INFO[tf]
     now = datetime.now(timezone.utc)
     fmt = "%Y-%m-%dT%H:%M:%S"
     rows = []
     for k in range(windows):
-        t_to = now - timedelta(days=CAPITAL_WINDOW_DAYS * k)
-        t_from = t_to - timedelta(days=CAPITAL_WINDOW_DAYS)
-        params = {"resolution": "MINUTE_15", "max": 1000, "from": t_from.strftime(fmt), "to": t_to.strftime(fmt)}
+        t_to = now - timedelta(days=info["days"] * k)
+        t_from = t_to - timedelta(days=info["days"])
+        params = {"resolution": info["res"], "max": 1000, "from": t_from.strftime(fmt), "to": t_to.strftime(fmt)}
         data = None
         err = "?"
         for _ in range(3):
@@ -254,22 +300,23 @@ def fetch_capital(windows):
                 continue
             break
         if data is None:
-            sys.exit("Capital.com no entrego velas (%s)" % err)
+            sys.exit("Capital.com no entrego velas de %s (%s)" % (info["name"], err))
         prices = data.get("prices") or []
         if len(prices) >= 1000:
-            print("AVISO: un tramo trajo 1000 velas (el maximo); podria faltar historial.")
+            print("AVISO: un tramo de %s trajo 1000 velas (el maximo); podria faltar historial." % info["name"])
         rows.extend(prices)
         time.sleep(0.3)
     bars = parse_capital(rows)
     if not bars:
-        sys.exit("Capital.com respondio sin velas. Revisa CAPITAL_EPIC (ahora: %s)." % CAPITAL_EPIC)
+        sys.exit("Capital.com respondio sin velas de %s. Revisa CAPITAL_EPIC (ahora: %s)."
+                 % (info["name"], CAPITAL_EPIC))
     return bars
 
 
-def fetch_bars(extended=False):
+def fetch_bars(tf, extended=False):
     if DATA_SOURCE == "capital":
-        return fetch_capital(5 if extended else 2)
-    return fetch_twelvedata()
+        return fetch_capital(tf, WINDOWS_EXTENDED if extended else WINDOWS_NORMAL)
+    return fetch_twelvedata(tf)
 
 
 def source_label():
@@ -284,7 +331,7 @@ def load_csv(path):
 
 
 def clean_bars(bars, now):
-    """Quita velas con mercado cerrado y la vela que aun no cierra."""
+    """Quita velas con mercado cerrado y la vela que aun no cierra (segun la temporalidad en uso)."""
     return [b for b in bars if market_open(b["t"]) and b["t"] + BAR <= now]
 
 
@@ -875,7 +922,7 @@ def build_message(group, bars):
     tag = " + ".join(x["ver"] for x in items)
     close = items[0]["close"]
 
-    lines = ["%s %s %s 15m  [%s]" % (icon, side, "XAU/USD", tag)]
+    lines = ["%s %s XAU/USD %s  [%s]" % (icon, side, TF_INFO[TF]["label"], tag)]
     for x in items:
         modelo = "B (continuacion)" if x["model"] == "B" else "A (barrido)"
         maxs = 5 if x["model"] == "B" else 6
@@ -895,7 +942,7 @@ def build_message(group, bars):
         for x in items:
             risk, tp = sl_tp(x)
             lines.append("%s -> SL %.2f (riesgo $%.2f) | TP 1:%g %.2f" % (x["ver"], x["sl"], risk, RR, tp))
-    lines.append("Vela cerrada: %s (hora Ecuador)" % fmt_t(close_time))
+    lines.append("Vela %s cerrada: %s (hora Ecuador)" % (tf_name(), fmt_t(close_time)))
     lines.append("")
     if DATA_SOURCE == "capital":
         lines.append("Precios de Capital.com (%s), el mismo feed de tu grafico con fuente Capital.com. "
@@ -935,10 +982,18 @@ def load_state():
 
 
 def save_state(state):
-    state["sent"] = state["sent"][-60:]
+    state["sent"] = state["sent"][-150:]
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=1)
         f.write("\n")
+
+
+def state_key(side, t):
+    """Clave para no avisar dos veces la misma senal. En M15 queda igual que antes."""
+    stamp = t.strftime("%Y-%m-%dT%H:%M")
+    if TF == 15:
+        return "%s|%s" % (side, stamp)
+    return "%s|%s|%s" % (side, tf_name(), stamp)
 
 
 # ============================================================================
@@ -964,10 +1019,10 @@ def run_capital_check():
     """Prueba la conexion con Capital.com: abre sesion, baja velas e imprime las ultimas."""
     if DATA_SOURCE != "capital":
         sys.exit("Este modo prueba Capital.com: pon DATA_SOURCE=capital")
-    raw = fetch_capital(1)
+    raw = fetch_capital(TF, 1)
     now = datetime.now(timezone.utc)
-    print("Sesion abierta en Capital.com (%s) | epic %s | precio %s | velas recibidas: %d"
-          % (CAPITAL_ENV_USED, CAPITAL_EPIC, CAPITAL_PRICE, len(raw)))
+    print("Sesion abierta en Capital.com (%s) | epic %s | precio %s | temporalidad %s | velas recibidas: %d"
+          % (CAPITAL_ENV_USED, CAPITAL_EPIC, CAPITAL_PRICE, tf_name(), len(raw)))
     print("Primera vela: %s | ultima vela recibida: %s (hora Ecuador)" % (fmt_t(raw[0]["t"]), fmt_t(raw[-1]["t"])))
     print("Ahora: %s (hora Ecuador)" % fmt_t(now))
     bars = clean_bars(raw, now)
@@ -975,9 +1030,10 @@ def run_capital_check():
         print("No hay velas cerradas con mercado abierto (fin de semana?).")
         return
     gaps = [(bars[k]["t"] - bars[k - 1]["t"]).total_seconds() / 60 for k in range(1, len(bars))]
-    print("Cierres de mercado dentro del historial (huecos de mas de 60 min): %d" % sum(1 for g in gaps if g > 60))
+    print("Cierres de mercado dentro del historial (huecos de mas de 3 velas): %d"
+          % sum(1 for g in gaps if g > 3 * TF))
     print()
-    print("Ultimas 12 velas cerradas, hora de APERTURA (hora Ecuador, igual que TradingView):")
+    print("Ultimas 12 velas %s cerradas, hora de APERTURA (hora Ecuador, igual que TradingView):" % tf_name())
     print("hora         |   apertura    maximo     minimo     cierre")
     for b in bars[-12:]:
         print("%s | %10.2f %10.2f %10.2f %10.2f" % (fmt_t(b["t"]), b["o"], b["h"], b["l"], b["c"]))
@@ -986,11 +1042,55 @@ def run_capital_check():
 
 
 # ============================================================================
+# Revision de una temporalidad (modo normal)
+# ============================================================================
+def check_timeframe(tf, now, state, raw=None):
+    """Revisa una temporalidad y manda los avisos nuevos. Devuelve True si hubo avisos (cambia el estado)."""
+    set_tf(tf)
+    name = tf_name()
+    if raw is None:
+        raw = fetch_bars(tf, False)
+    else:
+        now = raw[-1]["t"] + timedelta(days=1)     # (pruebas con CSV)
+    bars = clean_bars(raw, now)
+    if len(bars) < 300:
+        sys.exit("Muy pocas velas utiles (%d) en %s. Revisa el feed." % (len(bars), name))
+    last_close_time = bars[-1]["t"] + BAR
+    age_last = (now - last_close_time).total_seconds() / 60.0
+    print("[%s] Fuente: %s | velas: %d | ultima cerrada: %s UTC | ahora: %s UTC | atraso del feed: %.0f min | modo %s"
+          % (name, source_label(), len(bars), last_close_time.strftime("%Y-%m-%d %H:%M"),
+             now.strftime("%Y-%m-%d %H:%M"), age_last, FREQ))
+
+    groups = merge_signals(run_engine(bars, v9=False), run_engine(bars, v9=True))
+    n = len(bars)
+    fresh = [g for g in groups if g["i"] >= n - LOOKBACK_BARS]
+    changed = False
+    if not fresh:
+        print("[%s] Sin senales nuevas en las ultimas %d velas." % (name, LOOKBACK_BARS))
+    for s in fresh:
+        key = state_key(s["side"], bars[s["i"]]["t"])
+        if key in state["sent"]:
+            print("[%s] Ya avisada: %s" % (name, key))
+            continue
+        age = (now - (bars[s["i"]]["t"] + BAR)).total_seconds() / 60.0
+        if age > MAX_AGE_MIN:
+            print("[%s] Senal %s demasiado vieja (%.0f min), no se avisa." % (name, key, age))
+            continue
+        if send_telegram(build_message(s, bars)):
+            state["sent"].append(key)
+            changed = True
+            print("[%s] Aviso enviado: %s" % (name, key))
+    return changed
+
+
+# ============================================================================
 # Main
 # ============================================================================
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", default="normal", choices=["normal", "test", "history", "velas", "capital"])
+    ap.add_argument("--tf", type=int, default=15, choices=sorted(TF_INFO),
+                    help="temporalidad en minutos para capital / history / velas (15, 30 o 60)")
     ap.add_argument("--csv", help="(pruebas) leer velas de un CSV en vez de la API")
     args = ap.parse_args()
     now = datetime.now(timezone.utc)
@@ -1001,15 +1101,39 @@ def main():
         sys.exit(0 if ok else 1)
 
     if args.mode == "capital":
+        set_tf(args.tf)
         run_capital_check()
         return
 
-    if args.mode == "normal" and not market_open(now):
-        print("Mercado cerrado, nada que revisar.")
+    if args.mode == "normal":
+        if not market_open(now) and not args.csv:
+            print("Mercado cerrado, nada que revisar.")
+            return
+        state = load_state()
+        if args.csv:                                   # (pruebas) una sola temporalidad desde CSV
+            if check_timeframe(args.tf, now, state, raw=load_csv(args.csv)):
+                save_state(state)
+            return
+        ok_count = 0
+        errors = []
+        for tf in TIMEFRAMES:
+            try:
+                if check_timeframe(tf, now, state):
+                    save_state(state)                  # se guarda ya, por si falla la siguiente
+                ok_count += 1
+            except SystemExit as e:
+                msg = str(e.code) if e.code is not None else "error"
+                print("[%s] ERROR: %s" % (TF_INFO[tf]["name"], msg))
+                errors.append("%s: %s" % (TF_INFO[tf]["name"], msg))
+        if ok_count == 0:
+            sys.exit("Ninguna temporalidad pudo revisarse. " + " | ".join(errors))
+        if errors:
+            print("AVISO: fallaron estas temporalidades (las demas se revisaron): " + " | ".join(errors))
         return
 
-    extended = args.mode in ("history", "velas")
-    raw = load_csv(args.csv) if args.csv else fetch_bars(extended)
+    # ---- modos de diagnostico (history / velas): una sola temporalidad ----
+    set_tf(args.tf)
+    raw = load_csv(args.csv) if args.csv else fetch_bars(args.tf, True)
     if args.csv and raw:
         now = raw[-1]["t"] + timedelta(days=1)
     bars = clean_bars(raw, now)
@@ -1017,8 +1141,8 @@ def main():
         sys.exit("Muy pocas velas utiles (%d). Revisa el feed." % len(bars))
     last_close_time = bars[-1]["t"] + BAR
     age_last = (now - last_close_time).total_seconds() / 60.0
-    print("Fuente: %s | velas: %d | ultima cerrada: %s UTC | ahora: %s UTC | atraso del feed: %.0f min | modo %s"
-          % (source_label(), len(bars), last_close_time.strftime("%Y-%m-%d %H:%M"),
+    print("[%s] Fuente: %s | velas: %d | ultima cerrada: %s UTC | ahora: %s UTC | atraso del feed: %.0f min | modo %s"
+          % (tf_name(), source_label(), len(bars), last_close_time.strftime("%Y-%m-%d %H:%M"),
              now.strftime("%Y-%m-%d %H:%M"), age_last, FREQ))
 
     groups = merge_signals(run_engine(bars, v9=False), run_engine(bars, v9=True))
@@ -1028,46 +1152,21 @@ def main():
         print_history(groups, bars)
         return
 
-    if args.mode == "velas":
-        # Para comparar con TradingView: ultimas velas con hora de APERTURA (hora Ecuador,
-        # igual que la hora que muestra TradingView al pasar el mouse) y su O/H/L/C.
-        marks = {}
-        for g in groups:
-            for it in g["items"] + g["dups"]:
-                tag = "%s %s" % (g["side"], it["ver"])
-                marks.setdefault(it["label_i"], []).append("ETIQUETA " + tag)
-            marks.setdefault(g["i"], []).append("aviso %s" % g["side"])
-        last = bars[-VELAS_N:]
-        first_i = len(bars) - len(last)
-        print("Ultimas %d velas (15m), hora de apertura = hora Ecuador (UTC-5):" % len(last))
-        print("hora         |   apertura    maximo     minimo     cierre | marcas")
-        for k, b in enumerate(last):
-            m = ", ".join(marks.get(first_i + k, []))
-            print("%s | %10.2f %10.2f %10.2f %10.2f | %s"
-                  % (fmt_t(b["t"]), b["o"], b["h"], b["l"], b["c"], m))
-        return
-
-    n = len(bars)
-    state = load_state()
-    changed = False
-    fresh = [g for g in groups if g["i"] >= n - LOOKBACK_BARS]
-    if not fresh:
-        print("Sin senales nuevas en las ultimas %d velas." % LOOKBACK_BARS)
-    for s in fresh:
-        key = "%s|%s" % (s["side"], bars[s["i"]]["t"].strftime("%Y-%m-%dT%H:%M"))
-        if key in state["sent"]:
-            print("Ya avisada: %s" % key)
-            continue
-        age = (now - (bars[s["i"]]["t"] + BAR)).total_seconds() / 60.0
-        if age > MAX_AGE_MIN:
-            print("Senal %s demasiado vieja (%.0f min), no se avisa." % (key, age))
-            continue
-        if send_telegram(build_message(s, bars)):
-            state["sent"].append(key)
-            changed = True
-            print("Aviso enviado: %s" % key)
-    if changed:
-        save_state(state)
+    # velas: ultimas velas con hora de APERTURA (hora Ecuador, como TradingView) y su O/H/L/C
+    marks = {}
+    for g in groups:
+        for it in g["items"] + g["dups"]:
+            tag = "%s %s" % (g["side"], it["ver"])
+            marks.setdefault(it["label_i"], []).append("ETIQUETA " + tag)
+        marks.setdefault(g["i"], []).append("aviso %s" % g["side"])
+    last = bars[-VELAS_N:]
+    first_i = len(bars) - len(last)
+    print("Ultimas %d velas %s, hora de apertura = hora Ecuador (UTC-5):" % (len(last), tf_name()))
+    print("hora         |   apertura    maximo     minimo     cierre | marcas")
+    for k, b in enumerate(last):
+        m = ", ".join(marks.get(first_i + k, []))
+        print("%s | %10.2f %10.2f %10.2f %10.2f | %s"
+              % (fmt_t(b["t"]), b["o"], b["h"], b["l"], b["c"], m))
 
 
 if __name__ == "__main__":
