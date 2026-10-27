@@ -1,8 +1,8 @@
 name: Senales oro
 
+# El horario NO lo da GitHub (su "schedule" se atrasaba horas): lo da cron-job.org,
+# que llama a este workflow con workflow_dispatch.
 on:
- # schedule:
-   # - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       mode:
@@ -73,8 +73,8 @@ jobs:
           if [ -n "$(git status --porcelain state.json)" ]; then
             git config user.name "signal-bot"
             git config user.email "signal-bot@users.noreply.github.com"
-            git pull --rebase origin main
             git add state.json
             git commit -m "estado de avisos"
+            git pull --rebase origin main
             git push
           fi
