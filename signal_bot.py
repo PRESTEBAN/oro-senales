@@ -100,8 +100,8 @@ WINDOWS_NORMAL = 2         # tramos que se piden en el modo normal (por temporal
 WINDOWS_EXTENDED = 5       # tramos en los modos history / velas
 
 FREQ = os.getenv("FREQ", "Equilibrado")  # Estricto | Equilibrado | Alto
-LOOKBACK_BARS = 2   # avisa si la senal ocurrio en una de las ultimas N velas cerradas
-MAX_AGE_MIN = 45    # no avisa senales mas viejas que esto (datos atrasados / reinicios)
+LOOKBACK_BARS = 2    # avisa si la senal ocurrio en una de las ultimas N velas cerradas
+MAX_AGE_MIN = 45     # no avisa senales mas viejas que esto (datos atrasados / reinicios)
 
 # Espera al cierre de la vela (modo normal)
 CLOSE_MARGIN_S = float(os.getenv("CLOSE_MARGIN_S", "3"))   # segundos tras el cierre, para que la vela quede final
@@ -967,7 +967,7 @@ def killzone_text(t_open):
 def parse_event_time(text):
     dt = datetime.fromisoformat(str(text).strip().replace("Z", "+00:00"))
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=NY)            # Forex Factory publica en hora del Este si no trae zona
+        dt = dt.replace(tzinfo=NY)             # Forex Factory publica en hora del Este si no trae zona
     return dt.astimezone(timezone.utc)
 
 
@@ -980,16 +980,16 @@ def fetch_news():
     err = "?"
     for _ in range(2):
         try:
-            r = requests.get(NEWS_URL, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+            r = requests.get(NEWS_URL, timeout=6, headers={"User-Agent": "Mozilla/5.0"})
         except requests.RequestException as e:
             err = type(e).__name__
-            time.sleep(2)
+            time.sleep(1)
             continue
         if r.status_code != 200:
             err = "HTTP %d" % r.status_code
             if r.status_code == 429:
                 break
-            time.sleep(2)
+            time.sleep(1)
             continue
         try:
             data = r.json()
@@ -1135,8 +1135,18 @@ def build_message(group, bars, now=None):
             risk, tp = sl_tp(x)
             lines.append("%s -> SL %.2f (riesgo $%.2f) | TP 1:%g %.2f" % (x["ver"], x["sl"], risk, RR, tp))
     lines.append("Vela %s cerrada: %s (hora Ecuador)" % (tf_name(), fmt_t(close_time)))
-    lines.append(killzone_text(b["t"])[0])
-    lines.extend(news_lines(now or datetime.now(timezone.utc)))
+    
+    # Las lineas extra son informativas: jamas pueden frenar un aviso
+    try:
+        lines.append(killzone_text(b["t"])[0])
+    except Exception as e:
+        print("AVISO: no se pudo calcular la killzone (%s); el aviso sale igual." % type(e).__name__)
+        
+    try:
+        lines.extend(news_lines(now or datetime.now(timezone.utc)))
+    except Exception as e:
+        print("AVISO: no se pudo revisar las noticias (%s); el aviso sale igual." % type(e).__name__)
+
     lines.append("")
     if DATA_SOURCE == "capital":
         lines.append("Precios de Capital.com (%s), el mismo feed de tu grafico con fuente Capital.com. "
@@ -1306,13 +1316,13 @@ def main():
 
     if args.mode == "normal":
         if not args.csv:
-            now = wait_for_close(now)                       # si el cierre esta cerca, espera al cierre
+            now = wait_for_close(now)                        # si el cierre esta cerca, espera al cierre
             # se mira 1 minuto atras para no saltarse la ultima vela antes del cierre semanal
             if not market_open(now - timedelta(minutes=1)):
                 print("Mercado cerrado, nada que revisar.")
                 return
         state = load_state()
-        if args.csv:                                        # (pruebas) una sola temporalidad desde CSV
+        if args.csv:                                         # (pruebas) una sola temporalidad desde CSV
             if check_timeframe(args.tf, now, state, raw=load_csv(args.csv)):
                 save_state(state)
             return
@@ -1321,7 +1331,7 @@ def main():
         for tf in TIMEFRAMES:
             try:
                 if check_timeframe(tf, now, state):
-                    save_state(state)                       # se guarda ya, por si falla la siguiente
+                    save_state(state)                        # se guarda ya, por si falla la siguiente
                 ok_count += 1
             except SystemExit as e:
                 msg = str(e.code) if e.code is not None else "error"
