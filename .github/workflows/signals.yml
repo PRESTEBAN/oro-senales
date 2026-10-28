@@ -6,12 +6,13 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "normal = revisar senales | test = mensaje de prueba de Telegram | capital = probar conexion con Capital.com | history = senales del historial | velas = ultimas velas para comparar"
+        description: "normal = revisar senales | test = mensaje de prueba de Telegram | capital = probar conexion con Capital.com | noticias = ver las noticias rojas de USD de la semana | history = senales del historial | velas = ultimas velas para comparar"
         type: choice
         default: capital
         options:
           - capital
           - test
+          - noticias
           - velas
           - history
           - normal
