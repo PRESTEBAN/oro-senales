@@ -6,12 +6,13 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "normal = revisar senales | test = mensaje de prueba de Telegram | capital = probar conexion con Capital.com | noticias = ver las noticias rojas de USD de la semana | history = senales del historial | velas = ultimas velas para comparar"
+        description: "normal = revisar senales | test = mensaje de prueba de Telegram | capital = probar conexion con Capital.com | noticias = ver las noticias rojas de USD de la semana | backtest = medir cuanto aciertan las senales confirmadas y las tempranas | history = senales del historial | velas = ultimas velas para comparar"
         type: choice
         default: capital
         options:
           - capital
           - test
+          - backtest
           - noticias
           - velas
           - history
@@ -66,6 +67,7 @@ jobs:
           DATA_SOURCE: ${{ github.event.inputs.source || vars.DATA_SOURCE || 'twelvedata' }}
           TIMEFRAMES: ${{ vars.TIMEFRAMES || '15,30,60' }}
           CLOSE_MARGIN_S: ${{ vars.CLOSE_MARGIN_S || '3' }}
+          EARLY_ALERTS: ${{ vars.EARLY_ALERTS || '0' }}
           MODE: ${{ github.event.inputs.mode || 'normal' }}
           TF: ${{ github.event.inputs.tf || '15' }}
         run: python signal_bot.py --mode "$MODE" --tf "$TF"
