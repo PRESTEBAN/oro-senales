@@ -14,12 +14,16 @@ de margen y revisa en ese instante. Asi el tiempo de arranque de GitHub no cuent
 
 Temporalidades (variable TIMEFRAMES, por defecto "15,30,60"): M15, M30 y H1.
 Tu Pine usa la misma temporalidad superior (4H) en M15, M30 y H1, asi que el motor es el mismo.
+Cada aviso trae ademas: si la vela cerro dentro de una killzone (Londres 02-05 / Nueva York 08-11,
+hora de NY, como tu Pine) y una advertencia si hay una NOTICIA ROJA (impacto alto) de USD cerca.
+Ninguna de las dos cosas filtra senales: solo informan.
 Fuente de datos (variable DATA_SOURCE): capital | twelvedata
 Con Capital.com se usa el precio BID: es el que dibuja TradingView en CAPITALCOM:GOLD.
 
 Modos:  python signal_bot.py --mode normal    (el de siempre: revisa todas las temporalidades)
         python signal_bot.py --mode test      (manda un mensaje de prueba)
         python signal_bot.py --mode capital   [--tf 15|30|60]  (prueba la conexion e imprime velas)
+        python signal_bot.py --mode noticias  (muestra las noticias rojas de USD de la semana; no manda nada)
         python signal_bot.py --mode history   [--tf 15|30|60]  (senales del historial descargado)
         python signal_bot.py --mode velas     [--tf 15|30|60]  (ultimas 150 velas con sus marcas)
 Secrets: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
@@ -102,6 +106,33 @@ MAX_AGE_MIN = 45    # no avisa senales mas viejas que esto (datos atrasados / re
 # Espera al cierre de la vela (modo normal)
 CLOSE_MARGIN_S = float(os.getenv("CLOSE_MARGIN_S", "3"))   # segundos tras el cierre, para que la vela quede final
 MAX_WAIT_S = float(os.getenv("MAX_WAIT_S", "100"))         # solo espera si el cierre esta a menos de esto
+
+
+def parse_session(text):
+    """'HH:MM-HH:MM' -> (minuto de inicio, minuto de fin) del dia."""
+    try:
+        a, b = text.replace(" ", "").split("-")
+        h1, m1 = [int(x) for x in a.split(":")]
+        h2, m2 = [int(x) for x in b.split(":")]
+        if not (0 <= h1 < 24 and 0 <= h2 <= 24 and 0 <= m1 < 60 and 0 <= m2 < 60):
+            raise ValueError
+        return h1 * 60 + m1, h2 * 60 + m2
+    except (ValueError, TypeError):
+        sys.exit("Sesion invalida '%s' (usa HH:MM-HH:MM, hora de Nueva York)" % text)
+
+
+# Killzones: SOLO se marcan en el aviso, nunca filtran senales. Mismas horas que tu Pine (hora de Nueva York).
+KILLZONES = [("Londres", *parse_session(os.getenv("KZ_LONDON", "02:00-05:00"))),
+             ("Nueva York", *parse_session(os.getenv("KZ_NEWYORK", "08:00-11:00")))]
+
+# Eventos macro: SOLO se advierte en el aviso, nunca se bloquea nada. Fuente: calendario publico de Forex Factory.
+NEWS_ON = os.getenv("NEWS_ON", "1").strip() != "0"
+NEWS_COUNTRIES = {x.strip().upper() for x in os.getenv("NEWS_COUNTRIES", "USD").split(",") if x.strip()}
+NEWS_IMPACTS = {x.strip().lower() for x in os.getenv("NEWS_IMPACTS", "high").split(",") if x.strip()}
+NEWS_BEFORE_MIN = float(os.getenv("NEWS_BEFORE_MIN", "60"))   # avisa si el evento es en los proximos N min
+NEWS_AFTER_MIN = float(os.getenv("NEWS_AFTER_MIN", "30"))     # ...o si salio hace menos de N min
+NEWS_URL = os.getenv("NEWS_URL", "https://nfs.faireconomy.media/ff_calendar_thisweek.json")
+_NEWS = {"done": False, "events": None}
 
 if DATA_SOURCE not in ("capital", "twelvedata"):
     sys.exit("DATA_SOURCE debe ser capital o twelvedata")
@@ -909,6 +940,137 @@ def fmt_t(t):
     return t.astimezone(EC).strftime("%d/%m %H:%M")
 
 
+def _hm(mins):
+    return "%02d:%02d" % ((mins // 60) % 24, mins % 60)
+
+
+def killzone_text(t_open):
+    """Dice si la vela (por su hora de APERTURA, igual que el Pine) esta dentro de una killzone.
+    Devuelve (texto para el mensaje, nombre de la killzone o None)."""
+    ny = t_open.astimezone(NY)
+    mins = ny.hour * 60 + ny.minute
+    day0 = datetime(ny.year, ny.month, ny.day, tzinfo=NY)
+
+    def span(a, b):
+        ea = (day0 + timedelta(minutes=a)).astimezone(EC).strftime("%H:%M")
+        eb = (day0 + timedelta(minutes=b)).astimezone(EC).strftime("%H:%M")
+        return "%s-%s Ecuador / %s-%s NY" % (ea, eb, _hm(a), _hm(b))
+
+    for name, a, b in KILLZONES:
+        inside = (a <= mins < b) if a <= b else (mins >= a or mins < b)
+        if inside:
+            return "\u2705 Killzone: SI, dentro de %s (%s)" % (name, span(a, b)), name
+    detalle = " y ".join("%s (%s)" % (name, span(a, b)) for name, a, b in KILLZONES)
+    return "\u26AA Killzone: NO, fuera de %s" % detalle, None
+
+
+def parse_event_time(text):
+    dt = datetime.fromisoformat(str(text).strip().replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=NY)            # Forex Factory publica en hora del Este si no trae zona
+    return dt.astimezone(timezone.utc)
+
+
+def fetch_news():
+    """Baja el calendario de la semana UNA vez por ejecucion (solo cuando hay un aviso que mandar).
+    Devuelve la lista de eventos (hora UTC, titulo, pais) o None si no se pudo consultar."""
+    if _NEWS["done"]:
+        return _NEWS["events"]
+    _NEWS["done"] = True
+    err = "?"
+    for _ in range(2):
+        try:
+            r = requests.get(NEWS_URL, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        except requests.RequestException as e:
+            err = type(e).__name__
+            time.sleep(2)
+            continue
+        if r.status_code != 200:
+            err = "HTTP %d" % r.status_code
+            if r.status_code == 429:
+                break
+            time.sleep(2)
+            continue
+        try:
+            data = r.json()
+        except ValueError:
+            err = "la respuesta no es JSON"
+            break
+        if not isinstance(data, list):
+            err = "formato inesperado"
+            break
+        events = []
+        for e in data:
+            try:
+                country = str(e.get("country") or e.get("currency") or "").upper()
+                impact = str(e.get("impact", "")).lower()
+                if country in NEWS_COUNTRIES and impact in NEWS_IMPACTS:
+                    events.append((parse_event_time(e["date"]), str(e.get("title", "?")), country))
+            except (KeyError, ValueError, TypeError, AttributeError):
+                continue
+        _NEWS["events"] = events
+        print("Calendario economico: %d eventos %s (impacto %s) esta semana."
+              % (len(events), "/".join(sorted(NEWS_COUNTRIES)), "/".join(sorted(NEWS_IMPACTS))))
+        return events
+    _NEWS["events"] = None
+    print("Calendario economico NO disponible (%s)." % err)
+    return None
+
+
+def news_lines(now):
+    """Lineas de advertencia para el mensaje: SOLO si hay una noticia roja (impacto alto) de USD cerca.
+    Si no hay ninguna, no se agrega nada. Si el calendario no responde, se dice (el aviso sale igual)."""
+    if not NEWS_ON:
+        return []
+    events = fetch_news()
+    paises = "/".join(sorted(NEWS_COUNTRIES))
+    if events is None:
+        return ["\U0001F4F0 Calendario economico no disponible: revisa si hay noticias rojas de %s antes de entrar." % paises]
+    by_time = {}
+    for dt, title, country in events:
+        delta = (dt - now).total_seconds() / 60.0
+        if -NEWS_AFTER_MIN <= delta <= NEWS_BEFORE_MIN:
+            by_time.setdefault(dt, []).append(title)
+    out = []
+    for dt in sorted(by_time):
+        delta = (dt - now).total_seconds() / 60.0
+        cuando = "en %d min" % round(delta) if delta >= 0 else "salio hace %d min" % round(-delta)
+        out.append("\u26A0\uFE0F NOTICIA ROJA %s %s (%s Ecuador / %s NY): %s. "
+                   "Volatilidad fuerte: cuidado con la entrada y el SL."
+                   % (paises, cuando, dt.astimezone(EC).strftime("%H:%M"), dt.astimezone(NY).strftime("%H:%M"),
+                      ", ".join(by_time[dt])))
+    return out
+
+
+_DIAS = ["lun", "mar", "mie", "jue", "vie", "sab", "dom"]
+
+
+def run_news_check():
+    """Modo 'noticias': muestra el calendario que ve el bot y lo que diria un aviso enviado ahora."""
+    now = datetime.now(timezone.utc)
+    print("Ahora: %s hora Ecuador / %s hora NY" % (now.astimezone(EC).strftime("%d/%m %H:%M"),
+                                                   now.astimezone(NY).strftime("%d/%m %H:%M")))
+    print("Filtro: paises %s | impacto %s (rojo = high) | avisa si falta menos de %d min o salio hace menos de %d min"
+          % ("/".join(sorted(NEWS_COUNTRIES)), "/".join(sorted(NEWS_IMPACTS)), NEWS_BEFORE_MIN, NEWS_AFTER_MIN))
+    events = fetch_news()
+    if events is None:
+        print("No se pudo consultar el calendario (mira el mensaje de arriba).")
+        return
+    if not events:
+        print("El calendario no trae eventos con ese filtro esta semana.")
+        return
+    print("Eventos de la semana (compara con forexfactory.com/calendar):")
+    print("  dia   hora Ecuador | hora NY | evento")
+    for dt, title, country in sorted(events):
+        e, ny = dt.astimezone(EC), dt.astimezone(NY)
+        print("  %s %s   %s | %s | %s %s" % (_DIAS[e.weekday()], e.strftime("%d/%m"), e.strftime("%H:%M"),
+                                              ny.strftime("%H:%M"), country, title))
+    lines = news_lines(now)
+    print()
+    print("Lo que diria un aviso enviado AHORA:")
+    print("  " + ("(nada: no hay noticias rojas cerca)" if not lines else "\n  ".join(lines)))
+
+
 def merge_signals(*lists):
     """Junta las senales de v8 y v9 en UN aviso por etiqueta.
     1) misma vela de confirmacion y mismo lado -> un solo grupo [v8 + v9];
@@ -943,7 +1105,7 @@ def merge_signals(*lists):
     return out
 
 
-def build_message(group, bars):
+def build_message(group, bars, now=None):
     items = group["items"]
     b = bars[group["i"]]
     close_time = b["t"] + BAR
@@ -973,6 +1135,8 @@ def build_message(group, bars):
             risk, tp = sl_tp(x)
             lines.append("%s -> SL %.2f (riesgo $%.2f) | TP 1:%g %.2f" % (x["ver"], x["sl"], risk, RR, tp))
     lines.append("Vela %s cerrada: %s (hora Ecuador)" % (tf_name(), fmt_t(close_time)))
+    lines.append(killzone_text(b["t"])[0])
+    lines.extend(news_lines(now or datetime.now(timezone.utc)))
     lines.append("")
     if DATA_SOURCE == "capital":
         lines.append("Precios de Capital.com (%s), el mismo feed de tu grafico con fuente Capital.com. "
@@ -1037,9 +1201,10 @@ def print_history(groups, bars):
         tags = " + ".join(y["ver"] for y in g["items"])
         det = " / ".join("%s %s p%d%s" % (y["ver"], y["model"], y["score"], "*" if y["vp_decisive"] else "")
                          for y in g["items"])
-        print("%-6s [%-7s] %s | etiqueta en %s | confirmada %s | cierre %.2f SL %.2f"
+        kz = killzone_text(bars[g["i"]]["t"])[1] or "fuera"
+        print("%-6s [%-7s] %s | etiqueta en %s | confirmada %s | cierre %.2f SL %.2f | KZ: %s"
               % (g["side"], tags, det, fmt_t(bars[x["label_i"]]["t"]),
-                 fmt_t(bars[g["i"]]["t"] + BAR), x["close"], x["sl"]))
+                 fmt_t(bars[g["i"]]["t"] + BAR), x["close"], x["sl"], kz))
         for d in g["dups"]:
             print("       + %s confirma la misma etiqueta a las %s (no se avisa aparte)"
                   % (d["ver"], fmt_t(bars[d["i"]]["t"] + BAR)))
@@ -1106,7 +1271,7 @@ def check_timeframe(tf, now, state, raw=None):
         if age > MAX_AGE_MIN:
             print("[%s] Senal %s demasiado vieja (%.0f min), no se avisa." % (name, key, age))
             continue
-        if send_telegram(build_message(s, bars)):
+        if send_telegram(build_message(s, bars, now)):
             state["sent"].append(key)
             changed = True
             print("[%s] Aviso enviado: %s (%.1f min despues del cierre de la vela)" % (name, key, age))
@@ -1118,7 +1283,7 @@ def check_timeframe(tf, now, state, raw=None):
 # ============================================================================
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", default="normal", choices=["normal", "test", "history", "velas", "capital"])
+    ap.add_argument("--mode", default="normal", choices=["normal", "test", "history", "velas", "capital", "noticias"])
     ap.add_argument("--tf", type=int, default=15, choices=sorted(TF_INFO),
                     help="temporalidad en minutos para capital / history / velas (15, 30 o 60)")
     ap.add_argument("--csv", help="(pruebas) leer velas de un CSV en vez de la API")
@@ -1133,6 +1298,10 @@ def main():
     if args.mode == "capital":
         set_tf(args.tf)
         run_capital_check()
+        return
+
+    if args.mode == "noticias":
+        run_news_check()
         return
 
     if args.mode == "normal":
