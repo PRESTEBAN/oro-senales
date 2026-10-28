@@ -17,6 +17,12 @@ Tu Pine usa la misma temporalidad superior (4H) en M15, M30 y H1, asi que el mot
 Cada aviso trae ademas: si la vela cerro dentro de una killzone (Londres 02-05 / Nueva York 08-11,
 hora de NY, como tu Pine) y una advertencia si hay una NOTICIA ROJA (impacto alto) de USD cerca.
 Ninguna de las dos cosas filtra senales: solo informan.
+
+IMPORTANTE - CUANDO SALE CADA SENAL: el pico o suelo solo se conoce DESPUES de que el precio se aleja.
+La senal CONFIRMADA (COMPRA/VENTA) espera: barrido -> ruptura de estructura -> retroceso a la zona ->
+vela de giro. Por eso sale varias velas despues del extremo (la etiqueta que ves en el grafico se dibuja
+hacia atras sobre el pico/suelo). La senal TEMPRANA (variable EARLY_ALERTS=1) sale en cuanto se rompe la
+estructura, antes del retroceso: mas pronto, pero menos probada. El modo backtest mide ambas.
 Fuente de datos (variable DATA_SOURCE): capital | twelvedata
 Con Capital.com se usa el precio BID: es el que dibuja TradingView en CAPITALCOM:GOLD.
 
@@ -24,6 +30,8 @@ Modos:  python signal_bot.py --mode normal    (el de siempre: revisa todas las t
         python signal_bot.py --mode test      (manda un mensaje de prueba)
         python signal_bot.py --mode capital   [--tf 15|30|60]  (prueba la conexion e imprime velas)
         python signal_bot.py --mode noticias  (muestra las noticias rojas de USD de la semana; no manda nada)
+        python signal_bot.py --mode backtest  (mide con tus velas reales cuanto aciertan las senales
+                                               CONFIRMADAS y las TEMPRANAS; no manda nada)
         python signal_bot.py --mode history   [--tf 15|30|60]  (senales del historial descargado)
         python signal_bot.py --mode velas     [--tf 15|30|60]  (ultimas 150 velas con sus marcas)
 Secrets: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
@@ -100,8 +108,8 @@ WINDOWS_NORMAL = 2         # tramos que se piden en el modo normal (por temporal
 WINDOWS_EXTENDED = 5       # tramos en los modos history / velas
 
 FREQ = os.getenv("FREQ", "Equilibrado")  # Estricto | Equilibrado | Alto
-LOOKBACK_BARS = 2    # avisa si la senal ocurrio en una de las ultimas N velas cerradas
-MAX_AGE_MIN = 45     # no avisa senales mas viejas que esto (datos atrasados / reinicios)
+LOOKBACK_BARS = 2   # avisa si la senal ocurrio en una de las ultimas N velas cerradas
+MAX_AGE_MIN = 45    # no avisa senales mas viejas que esto (datos atrasados / reinicios)
 
 # Espera al cierre de la vela (modo normal)
 CLOSE_MARGIN_S = float(os.getenv("CLOSE_MARGIN_S", "3"))   # segundos tras el cierre, para que la vela quede final
@@ -133,6 +141,16 @@ NEWS_BEFORE_MIN = float(os.getenv("NEWS_BEFORE_MIN", "60"))   # avisa si el even
 NEWS_AFTER_MIN = float(os.getenv("NEWS_AFTER_MIN", "30"))     # ...o si salio hace menos de N min
 NEWS_URL = os.getenv("NEWS_URL", "https://nfs.faireconomy.media/ff_calendar_thisweek.json")
 _NEWS = {"done": False, "events": None}
+
+# Senales TEMPRANAS (estructura rota, antes del retroceso). Apagadas por defecto hasta que midas el backtest.
+EARLY_ALERTS = os.getenv("EARLY_ALERTS", "0").strip() == "1"
+EARLY_MAX_RISK_ATR = float(os.getenv("EARLY_MAX_RISK_ATR", "3.0"))   # SL maximo permitido (x ATR)
+EARLY_COOLDOWN = int(os.getenv("EARLY_COOLDOWN", "4"))               # velas minimas entre tempranas
+
+# Backtest
+BT_SPREAD = float(os.getenv("BACKTEST_SPREAD", "0.5"))        # spread en $ (Capital muestra 0.50 en el oro)
+BT_HORIZON = int(os.getenv("BACKTEST_HORIZON", "200"))        # velas maximas que se sigue cada operacion
+BT_WARMUP = 250                                               # se ignoran las senales de las primeras velas
 
 if DATA_SOURCE not in ("capital", "twelvedata"):
     sys.exit("DATA_SOURCE debe ser capital o twelvedata")
@@ -458,8 +476,9 @@ def build_context(bars):
 # ============================================================================
 # Motor de senales (port fiel del Pine v9)
 # ============================================================================
-def run_engine(bars, v9=True):
-    """v9=True: indicador v9. v9=False: indicador v8 (sin los 4 cambios del Modelo B)."""
+def run_engine(bars, v9=True, early_out=None):
+    """v9=True: indicador v9. v9=False: indicador v8 (sin los 4 cambios del Modelo B).
+    early_out: si se pasa una lista, ahi se agregan las senales TEMPRANAS (solo tiene sentido con v9=True)."""
     n = len(bars)
     O = [b["o"] for b in bars]
     H = [b["h"] for b in bars]
@@ -568,6 +587,7 @@ def run_engine(bars, v9=True):
     lastHighIBar = lastLowIBar = None
     highIUsed = lowIUsed = False
     lastSig = -1000
+    lastEarlyB = lastEarlyS = -1000
 
     bState = 0
     bSweepBar = 0
@@ -666,6 +686,7 @@ def run_engine(bars, v9=True):
         # ================= ALCISTA =================
         bullTrig = False
         bSl = None
+        bEarlyEvt = False
 
         if bState == 1:
             if l < bLowPx:
@@ -678,6 +699,7 @@ def run_engine(bars, v9=True):
                     and i > bSweepBar and (c - o) >= dispATR * a):
                 bState = 2
                 bMssBar = i
+                bEarlyEvt = True
             elif i - bLowBar > mssWait:
                 bState = 0
 
@@ -771,6 +793,18 @@ def run_engine(bars, v9=True):
             bHigh = hiSinceLowI
             bPdl = False
             bCont = True
+            bEarlyEvt = True
+
+        # ---- Senal TEMPRANA alcista: estructura rota (MSS/BOS), todavia sin retroceso ni giro ----
+        if bEarlyEvt and early_out is not None and (i - lastEarlyB) > EARLY_COOLDOWN:
+            legMinE = (CONT_MIN_LEG_ATR if (bCont and v9) else minLegATR) * a
+            slE = bLowPx - SL_BUF * a
+            riskE = c - slE
+            if ((bHigh - bLowPx) >= legMinE and riskE >= MIN_RISK_ATR * a
+                    and riskE <= EARLY_MAX_RISK_ATR * a and (not REQ_HTF or htfBull)):
+                lastEarlyB = i
+                early_out.append(dict(side="COMPRA", i=i, label_i=bLowBar, extreme=bLowPx, close=c, sl=slE,
+                                      model="B" if bCont else "A"))
 
         buySig = False
         bScore = 0
@@ -791,6 +825,7 @@ def run_engine(bars, v9=True):
         # ================= BAJISTA =================
         bearTrig = False
         sSl = None
+        sEarlyEvt = False
 
         if sState == 1:
             if h > sHighPx:
@@ -803,6 +838,7 @@ def run_engine(bars, v9=True):
                     and i > sSweepBar and (o - c) >= dispATR * a):
                 sState = 2
                 sMssBar = i
+                sEarlyEvt = True
             elif i - sHighBar > mssWait:
                 sState = 0
 
@@ -896,6 +932,18 @@ def run_engine(bars, v9=True):
             sLow = loSinceHighI
             sPdh = False
             sCont = True
+            sEarlyEvt = True
+
+        # ---- Senal TEMPRANA bajista: estructura rota (MSS/BOS), todavia sin retroceso ni giro ----
+        if sEarlyEvt and early_out is not None and (i - lastEarlyS) > EARLY_COOLDOWN:
+            legMinE = (CONT_MIN_LEG_ATR if (sCont and v9) else minLegATR) * a
+            slE = sHighPx + SL_BUF * a
+            riskE = slE - c
+            if ((sHighPx - sLow) >= legMinE and riskE >= MIN_RISK_ATR * a
+                    and riskE <= EARLY_MAX_RISK_ATR * a and (not REQ_HTF or htfBear)):
+                lastEarlyS = i
+                early_out.append(dict(side="VENTA", i=i, label_i=sHighBar, extreme=sHighPx, close=c, sl=slE,
+                                      model="B" if sCont else "A"))
 
         sellSig = False
         sScore = 0
@@ -1157,6 +1205,40 @@ def build_message(group, bars, now=None):
     return "\n".join(lines)
 
 
+def build_early_message(e, bars, now=None):
+    """Mensaje de la ALERTA TEMPRANA: estructura rota, antes del retroceso y del giro."""
+    now = now or datetime.now(timezone.utc)
+    b = bars[e["i"]]
+    close_time = b["t"] + BAR
+    side = e["side"]
+    sign = 1 if side == "COMPRA" else -1
+    risk = abs(e["close"] - e["sl"])
+    extremo = "suelo" if side == "COMPRA" else "pico"
+    lines = ["\U0001F7E1 ALERTA TEMPRANA %s XAU/USD %s" % (side, TF_INFO[TF]["label"]),
+             "Se rompio la estructura (Modelo %s). Sale ANTES que la senal normal, pero todavia NO confirma "
+             "el retroceso ni el giro: es menos probada." % e["model"],
+             "Cierre de vela: %.2f (ya se alejo $%.2f del %s)" % (e["close"], abs(e["close"] - e["extreme"]), extremo),
+             "SL (detras del %s): %.2f (riesgo $%.2f)" % (extremo, e["sl"], risk),
+             "Objetivos: 1:2 -> %.2f | 1:3 -> %.2f" % (e["close"] + sign * 2 * risk, e["close"] + sign * 3 * risk),
+             "Vela %s cerrada: %s (hora Ecuador)" % (tf_name(), fmt_t(close_time))]
+    try:
+        lines.append(killzone_text(b["t"])[0])
+    except Exception as ex:
+        print("AVISO: no se pudo calcular la killzone (%s); el aviso sale igual." % type(ex).__name__)
+    try:
+        lines.extend(news_lines(now))
+    except Exception as ex:
+        print("AVISO: no se pudo revisar las noticias (%s); el aviso sale igual." % type(ex).__name__)
+    lines.append("")
+    if DATA_SOURCE == "capital":
+        lines.append("Precios de Capital.com (%s), el mismo feed de tu grafico con fuente Capital.com. "
+                     "Confirma en tu grafico antes de operar." % CAPITAL_PRICE)
+    else:
+        lines.append("Precios del feed Twelve Data: pueden diferir unos dolares de TradingView. "
+                     "Confirma en tu grafico antes de operar.")
+    return "\n".join(lines)
+
+
 def send_telegram(text):
     token = os.getenv("TELEGRAM_TOKEN")
     chat = os.getenv("TELEGRAM_CHAT_ID")
@@ -1247,6 +1329,141 @@ def run_capital_check():
 
 
 # ============================================================================
+# Backtest y diagnostico de senales
+# ============================================================================
+def bt_simulate(bars, i, side, close, sl):
+    """Sigue la operacion vela a vela desde la SIGUIENTE al aviso. Entrada = cierre de la vela del aviso.
+    Compras entran al ASK (cierre + spread) y salen al BID; ventas entran al BID y salen al ASK.
+    Si una vela toca el SL se cierra (se revisa el SL primero, que es lo mas duro).
+    Devuelve (maximo R alcanzado antes del SL, si ya se cerro por SL) o None si el riesgo no es valido."""
+    n = len(bars)
+    sp = BT_SPREAD
+    if side == "COMPRA":
+        entry = close + sp
+        risk = entry - sl
+    else:
+        entry = close
+        risk = sl - entry
+    if risk <= 0:
+        return None
+    max_r = 0.0
+    for k in range(i + 1, min(n, i + 1 + BT_HORIZON)):
+        b = bars[k]
+        if side == "COMPRA":
+            if b["l"] <= sl:
+                return max_r, True
+            max_r = max(max_r, (b["h"] - entry) / risk)
+        else:
+            if b["h"] + sp >= sl:
+                return max_r, True
+            max_r = max(max_r, (entry - (b["l"] + sp)) / risk)
+    return max_r, False
+
+
+def bt_rows(bars, items):
+    rows = []
+    for it in items:
+        r = bt_simulate(bars, it["i"], it["side"], it["close"], it["sl"])
+        if r is not None:
+            rows.append(r)
+    return rows
+
+
+def bt_line(name, rows):
+    """'gana' = de las operaciones ya resueltas, las que llegaron al objetivo antes que al SL."""
+    if not rows:
+        return "    %-26s sin senales" % name
+    parts = []
+    for T in (1, 2, 3):
+        w = sum(1 for m, _ in rows if m >= T)
+        l = sum(1 for m, c in rows if c and m < T)
+        if w + l == 0:
+            parts.append("%dR: --" % T)
+            continue
+        parts.append("%dR: gana %3.0f%% (R/op %+.2f)" % (T, 100.0 * w / (w + l), (w * T - l) / float(w + l)))
+    return "    %-26s N=%-3d | %s" % (name, len(rows), " | ".join(parts))
+
+
+def _med(v):
+    v = sorted(v)
+    return v[len(v) // 2] if v else 0.0
+
+
+def bt_delay(bars, items):
+    """Cuanto despues del pico/suelo sale la senal: velas y dolares (medianas)."""
+    if not items:
+        return ""
+    velas = [it["i"] - it["label_i"] for it in items]
+    dolares = [abs(it["close"] - it["extreme"]) for it in items]
+    return "    -> salen en mediana %d velas despues del pico/suelo y a $%.2f de distancia de el" % (_med(velas), _med(dolares))
+
+
+def run_backtest():
+    """Mide con las velas reales cuanto aciertan las senales CONFIRMADAS (las de hoy) y las TEMPRANAS."""
+    print("BACKTEST de las senales con las velas reales que baja el bot.")
+    print("Entrada = cierre de la vela del aviso. Spread incluido: $%.2f. Si una vela toca el SL y el objetivo a la vez, "
+          "cuenta como SL." % BT_SPREAD)
+    print("'gana' = de las operaciones YA resueltas, las que llegaron a ese objetivo antes que al SL. "
+          "'R/op' = ganancia media por operacion en multiplos de lo arriesgado (1R = el SL).")
+    print("Es el pasado de unas semanas: orienta, no garantiza el futuro. Las operaciones abiertas que aun no llegan "
+          "al objetivo ni al SL no se cuentan.")
+    ok_count = 0
+    for tf in TIMEFRAMES:
+        set_tf(tf)
+        try:
+            raw = fetch_bars(tf, True)
+        except SystemExit as e:
+            print("\n[%s] ERROR: %s" % (tf_name(), e.code))
+            continue
+        bars = clean_bars(raw, datetime.now(timezone.utc))
+        if len(bars) < 400:
+            print("\n[%s] Muy pocas velas utiles (%d)." % (tf_name(), len(bars)))
+            continue
+        ok_count += 1
+        early = []
+        groups = merge_signals(run_engine(bars, v9=False), run_engine(bars, v9=True, early_out=early))
+        conf = []
+        for g in groups:
+            if g["i"] < BT_WARMUP:
+                continue
+            x = g["items"][0]
+            ext = bars[x["label_i"]]["l"] if g["side"] == "COMPRA" else bars[x["label_i"]]["h"]
+            conf.append(dict(i=g["i"], label_i=x["label_i"], side=g["side"], close=x["close"], sl=x["sl"], extreme=ext))
+        early = [e for e in early if e["i"] >= BT_WARMUP]
+
+        def split(items):
+            dentro = [it for it in items if killzone_text(bars[it["i"]]["t"])[1]]
+            fuera = [it for it in items if not killzone_text(bars[it["i"]]["t"])[1]]
+            return dentro, fuera
+
+        print()
+        print("=== %s | %d velas | %s -> %s (hora Ecuador) | fuente %s ===" % (
+            tf_name(), len(bars), fmt_t(bars[0]["t"]), fmt_t(bars[-1]["t"]), source_label()))
+        for titulo, items in (("CONFIRMADAS (las que el bot avisa hoy)", conf),
+                              ("TEMPRANAS (estructura rota, antes del retroceso)", early)):
+            print("  " + titulo)
+            dentro, fuera = split(items)
+            print(bt_line("todas", bt_rows(bars, items)))
+            print(bt_line("dentro de killzone", bt_rows(bars, dentro)))
+            print(bt_line("fuera de killzone", bt_rows(bars, fuera)))
+            d = bt_delay(bars, items)
+            if d:
+                print(d)
+    if ok_count == 0:
+        sys.exit("No se pudo medir ninguna temporalidad.")
+
+
+def print_early(early, bars):
+    print()
+    print("Senales TEMPRANAS (PRE-COMPRA / PRE-VENTA) en el historial (%d):" % len(early))
+    for e in early:
+        kz = killzone_text(bars[e["i"]]["t"])[1] or "fuera"
+        print("%-6s modelo %s | pico/suelo %s | sale %s (%d velas despues) | cierre %.2f SL %.2f (riesgo $%.2f) | KZ: %s"
+              % (e["side"], e["model"], fmt_t(bars[e["label_i"]]["t"]), fmt_t(bars[e["i"]]["t"] + BAR),
+                 e["i"] - e["label_i"], e["close"], e["sl"], abs(e["close"] - e["sl"]), kz))
+
+
+# ============================================================================
 # Revision de una temporalidad (modo normal)
 # ============================================================================
 def check_timeframe(tf, now, state, raw=None):
@@ -1266,7 +1483,9 @@ def check_timeframe(tf, now, state, raw=None):
           % (name, source_label(), len(bars), last_close_time.strftime("%Y-%m-%d %H:%M"),
              now.strftime("%Y-%m-%d %H:%M"), age_last, FREQ))
 
-    groups = merge_signals(run_engine(bars, v9=False), run_engine(bars, v9=True))
+    early = []
+    groups = merge_signals(run_engine(bars, v9=False),
+                           run_engine(bars, v9=True, early_out=early if EARLY_ALERTS else None))
     n = len(bars)
     fresh = [g for g in groups if g["i"] >= n - LOOKBACK_BARS]
     changed = False
@@ -1285,6 +1504,20 @@ def check_timeframe(tf, now, state, raw=None):
             state["sent"].append(key)
             changed = True
             print("[%s] Aviso enviado: %s (%.1f min despues del cierre de la vela)" % (name, key, age))
+    if EARLY_ALERTS:
+        for e in [x for x in early if x["i"] >= n - LOOKBACK_BARS]:
+            key = "E|" + state_key(e["side"], bars[e["i"]]["t"])
+            if key in state["sent"]:
+                print("[%s] Alerta temprana ya avisada: %s" % (name, key))
+                continue
+            age = (now - (bars[e["i"]]["t"] + BAR)).total_seconds() / 60.0
+            if age > MAX_AGE_MIN:
+                print("[%s] Alerta temprana %s demasiado vieja (%.0f min), no se avisa." % (name, key, age))
+                continue
+            if send_telegram(build_early_message(e, bars, now)):
+                state["sent"].append(key)
+                changed = True
+                print("[%s] Alerta temprana enviada: %s (%.1f min despues del cierre de la vela)" % (name, key, age))
     return changed
 
 
@@ -1293,7 +1526,7 @@ def check_timeframe(tf, now, state, raw=None):
 # ============================================================================
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", default="normal", choices=["normal", "test", "history", "velas", "capital", "noticias"])
+    ap.add_argument("--mode", default="normal", choices=["normal", "test", "history", "velas", "capital", "noticias", "backtest"])
     ap.add_argument("--tf", type=int, default=15, choices=sorted(TF_INFO),
                     help="temporalidad en minutos para capital / history / velas (15, 30 o 60)")
     ap.add_argument("--csv", help="(pruebas) leer velas de un CSV en vez de la API")
@@ -1314,15 +1547,19 @@ def main():
         run_news_check()
         return
 
+    if args.mode == "backtest":
+        run_backtest()
+        return
+
     if args.mode == "normal":
         if not args.csv:
-            now = wait_for_close(now)                        # si el cierre esta cerca, espera al cierre
+            now = wait_for_close(now)                       # si el cierre esta cerca, espera al cierre
             # se mira 1 minuto atras para no saltarse la ultima vela antes del cierre semanal
             if not market_open(now - timedelta(minutes=1)):
                 print("Mercado cerrado, nada que revisar.")
                 return
         state = load_state()
-        if args.csv:                                         # (pruebas) una sola temporalidad desde CSV
+        if args.csv:                                        # (pruebas) una sola temporalidad desde CSV
             if check_timeframe(args.tf, now, state, raw=load_csv(args.csv)):
                 save_state(state)
             return
@@ -1331,7 +1568,7 @@ def main():
         for tf in TIMEFRAMES:
             try:
                 if check_timeframe(tf, now, state):
-                    save_state(state)                        # se guarda ya, por si falla la siguiente
+                    save_state(state)                       # se guarda ya, por si falla la siguiente
                 ok_count += 1
             except SystemExit as e:
                 msg = str(e.code) if e.code is not None else "error"
@@ -1357,11 +1594,13 @@ def main():
           % (tf_name(), source_label(), len(bars), last_close_time.strftime("%Y-%m-%d %H:%M"),
              now.strftime("%Y-%m-%d %H:%M"), age_last, FREQ))
 
-    groups = merge_signals(run_engine(bars, v9=False), run_engine(bars, v9=True))
+    early = []
+    groups = merge_signals(run_engine(bars, v9=False), run_engine(bars, v9=True, early_out=early))
 
     if args.mode == "history":
         print("(ignora las senales de los primeros dias: el indicador necesita velas para calentarse)")
         print_history(groups, bars)
+        print_early(early, bars)
         return
 
     # velas: ultimas velas con hora de APERTURA (hora Ecuador, como TradingView) y su O/H/L/C
