@@ -32,6 +32,9 @@ Modos:  python signal_bot.py --mode normal    (el de siempre: revisa todas las t
         python signal_bot.py --mode noticias  (muestra las noticias rojas de USD de la semana; no manda nada)
         python signal_bot.py --mode backtest  (mide con tus velas reales cuanto aciertan las senales
                                                CONFIRMADAS y las TEMPRANAS; no manda nada)
+        python signal_bot.py --mode lab       (LABORATORIO del indicador "Reversal Pro": prueba filtros uno a uno
+                                               y en combinacion con 120 dias de velas reales, separando
+                                               entrenamiento y prueba; no manda nada)
         python signal_bot.py --mode history   [--tf 15|30|60]  (senales del historial descargado)
         python signal_bot.py --mode velas     [--tf 15|30|60]  (ultimas 150 velas con sus marcas)
 Secrets: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
@@ -151,6 +154,11 @@ EARLY_COOLDOWN = int(os.getenv("EARLY_COOLDOWN", "4"))               # velas min
 BT_SPREAD = float(os.getenv("BACKTEST_SPREAD", "0.5"))        # spread en $ (Capital muestra 0.50 en el oro)
 BT_HORIZON = int(os.getenv("BACKTEST_HORIZON", "200"))        # velas maximas que se sigue cada operacion
 BT_WARMUP = 250                                               # se ignoran las senales de las primeras velas
+
+# Laboratorio "Reversal Pro"
+LAB_DAYS = int(os.getenv("LAB_DAYS", "120"))                  # dias de velas que baja el laboratorio
+LAB_TRAIN = float(os.getenv("LAB_TRAIN", "0.6"))              # parte inicial que se usa para ELEGIR filtros
+LAB_MIN_N = int(os.getenv("LAB_MIN_N", "25"))                 # minimo de operaciones resueltas para fiarse de un filtro
 
 if DATA_SOURCE not in ("capital", "twelvedata"):
     sys.exit("DATA_SOURCE debe ser capital o twelvedata")
@@ -1463,6 +1471,243 @@ def print_early(early, bars):
                  e["i"] - e["label_i"], e["close"], e["sl"], abs(e["close"] - e["sl"]), kz))
 
 
+# ---------------------------------------------------------------------------
+# Laboratorio del indicador "Oro Sniper Reversal Pro" (giro en pico/suelo, confirmacion de 2 velas)
+# ---------------------------------------------------------------------------
+RV_BASE = dict(use_ext=True, lookback=50, use_pdh=True, use_bb=True, bb_mult=2.2, rsi_sell=60.0, rsi_buy=40.0,
+               use_htf=True, cooldown=6, wick=0.0, body=0.0, maxrisk=0.0, kz_only=False, pd=False)
+
+# (familia, nombre, cambios). Dentro de una familia solo se elige una variante.
+RV_VARIANTS = [
+    ("mecha", "mecha de rechazo del pico >= 35% de la vela", dict(wick=0.35)),
+    ("mecha", "mecha de rechazo del pico >= 50% de la vela", dict(wick=0.50)),
+    ("cuerpo", "vela de confirmacion con cuerpo >= 0.5 ATR", dict(body=0.5)),
+    ("cuerpo", "vela de confirmacion con cuerpo >= 1.0 ATR", dict(body=1.0)),
+    ("riesgo", "riesgo (entrada a SL) <= 1.5 ATR", dict(maxrisk=1.5)),
+    ("riesgo", "riesgo (entrada a SL) <= 2.0 ATR", dict(maxrisk=2.0)),
+    ("riesgo", "riesgo (entrada a SL) <= 3.0 ATR", dict(maxrisk=3.0)),
+    ("killzone", "solo dentro de killzone (Londres / Nueva York)", dict(kz_only=True)),
+    ("pd", "venta solo en premium / compra solo en discount (rango 100 velas)", dict(pd=True)),
+    ("rsi", "RSI 65 / 35", dict(rsi_sell=65.0, rsi_buy=35.0)),
+    ("rsi", "RSI 70 / 30", dict(rsi_sell=70.0, rsi_buy=30.0)),
+    ("bb", "Bollinger 2.0 desviaciones", dict(bb_mult=2.0)),
+    ("bb", "Bollinger 2.6 desviaciones", dict(bb_mult=2.6)),
+    ("bb", "sin Bollinger", dict(use_bb=False)),
+    ("htf", "sin filtro de tendencia 4H", dict(use_htf=False)),
+    ("barrido", "barrer solo el extremo de 30 velas (y PDH/PDL)", dict(lookback=30)),
+    ("barrido", "barrer solo el extremo de 100 velas (y PDH/PDL)", dict(lookback=100)),
+    ("barrido", "barrer solo PDH/PDL (maximo/minimo del dia anterior)", dict(use_ext=False)),
+]
+
+
+def rv_features(bars):
+    """Calculos del indicador, una sola vez (los comparten todas las configuraciones)."""
+    n = len(bars)
+    O = [b["o"] for b in bars]
+    H = [b["h"] for b in bars]
+    L = [b["l"] for b in bars]
+    C = [b["c"] for b in bars]
+    tr = [H[0] - L[0]] + [max(H[i] - L[i], abs(H[i] - C[i - 1]), abs(L[i] - C[i - 1])) for i in range(1, n)]
+    atr = rma(tr, 14)
+    ups = [0.0] + [max(C[i] - C[i - 1], 0.0) for i in range(1, n)]
+    dns = [0.0] + [max(C[i - 1] - C[i], 0.0) for i in range(1, n)]
+    au, ad = rma(ups, 14, start=1), rma(dns, 14, start=1)
+    rsi = [None] * n
+    for i in range(n):
+        if au[i] is not None:
+            rsi[i] = 100.0 if ad[i] == 0 else 100.0 - 100.0 / (1.0 + au[i] / ad[i])
+    sma = [None] * n
+    std = [None] * n
+    for i in range(19, n):
+        w = C[i - 19:i + 1]
+        m = sum(w) / 20.0
+        sma[i] = m
+        std[i] = math.sqrt(sum((x - m) ** 2 for x in w) / 20.0)      # desviacion poblacional, como Pine
+    pH, pL = {}, {}
+    for lb in (30, 50, 100):
+        ph = [None] * n
+        pl = [None] * n
+        for k in range(lb, n):
+            ph[k] = max(H[k - lb:k])
+            pl[k] = min(L[k - lb:k])
+        pH[lb], pL[lb] = ph, pl
+    mid = [None] * n
+    for i in range(PD_LEN - 1, n):
+        mid[i] = (max(H[i - PD_LEN + 1:i + 1]) + min(L[i - PD_LEN + 1:i + 1])) / 2.0
+    htf_cl, htf_ema, pdh, pdl = build_context(bars)
+    return dict(O=O, H=H, L=L, C=C, atr=atr, rsi=rsi, sma=sma, std=std, pH=pH, pL=pL, mid=mid,
+                htf_cl=htf_cl, htf_ema=htf_ema, pdh=pdh, pdl=pdl)
+
+
+def rv_signals(bars, F, cfg, start=BT_WARMUP):
+    """Senales del Reversal Pro con la configuracion cfg. Vela 1 = pico/suelo, vela 2 = confirmacion (entrada)."""
+    O, H, L, C = F["O"], F["H"], F["L"], F["C"]
+    atr, rsi, sma, std = F["atr"], F["rsi"], F["sma"], F["std"]
+    pH, pL = F["pH"][cfg["lookback"]], F["pL"][cfg["lookback"]]
+    sigs = []
+    last = -1000
+    for i in range(max(start, 120), len(bars)):
+        a = atr[i]
+        j = i - 1
+        if a is None or rsi[j] is None or sma[j] is None or (i - last) <= cfg["cooldown"]:
+            continue
+        hc, he = F["htf_cl"][i], F["htf_ema"][i]
+        bull4 = hc is not None and he is not None and hc > he
+        bear4 = hc is not None and he is not None and hc < he
+        rng1 = H[j] - L[j]
+        side = None
+        # ---- VENTA: vela 1 barre un maximo y deja mecha; vela 2 cierra por debajo del minimo de la vela 1 ----
+        sweep = (cfg["use_ext"] and pH[j] is not None and H[j] > pH[j]) or \
+                (cfg["use_pdh"] and F["pdh"][i] is not None and H[j] > F["pdh"][i])
+        if (sweep and (not cfg["use_bb"] or H[j] > sma[j] + cfg["bb_mult"] * std[j]) and rsi[j] >= cfg["rsi_sell"]
+                and C[i] < L[j] and (not cfg["use_htf"] or bear4)):
+            sl = H[j] + SL_BUF * a
+            risk = sl - C[i]
+            wick = (H[j] - max(O[j], C[j])) / rng1 if rng1 > 0 else 0.0
+            body = (O[i] - C[i]) / a
+            ok_pd = (not cfg["pd"]) or (F["mid"][i] is not None and C[i] >= F["mid"][i])
+            side = "VENTA"
+        else:
+            # ---- COMPRA: vela 1 barre un minimo y deja mecha; vela 2 cierra por encima del maximo de la vela 1 ----
+            sweep = (cfg["use_ext"] and pL[j] is not None and L[j] < pL[j]) or \
+                    (cfg["use_pdh"] and F["pdl"][i] is not None and L[j] < F["pdl"][i])
+            if (sweep and (not cfg["use_bb"] or L[j] < sma[j] - cfg["bb_mult"] * std[j]) and rsi[j] <= cfg["rsi_buy"]
+                    and C[i] > H[j] and (not cfg["use_htf"] or bull4)):
+                sl = L[j] - SL_BUF * a
+                risk = C[i] - sl
+                wick = (min(O[j], C[j]) - L[j]) / rng1 if rng1 > 0 else 0.0
+                body = (C[i] - O[i]) / a
+                ok_pd = (not cfg["pd"]) or (F["mid"][i] is not None and C[i] <= F["mid"][i])
+                side = "COMPRA"
+        if side is None:
+            continue
+        if (wick < cfg["wick"] or body < cfg["body"] or not ok_pd or risk <= 0
+                or (cfg["maxrisk"] > 0 and risk > cfg["maxrisk"] * a)):
+            continue
+        if cfg["kz_only"] and not killzone_text(bars[i]["t"])[1]:
+            continue
+        last = i
+        sigs.append(dict(i=i, label_i=j, side=side, close=C[i], sl=sl,
+                         extreme=H[j] if side == "VENTA" else L[j]))
+    return sigs
+
+
+def rv_eval(bars, sigs, lo, hi):
+    """Resultado de las senales cuya vela cae en [lo, hi): para cada objetivo T (1R, 2R, 3R) -> (ganadas, perdidas)."""
+    rows = []
+    for sg in sigs:
+        if lo <= sg["i"] < hi:
+            r = bt_simulate(bars, sg["i"], sg["side"], sg["close"], sg["sl"])
+            if r is not None:
+                rows.append(r)
+    out = {"n": len(rows)}
+    for T in (1, 2, 3):
+        out[T] = (sum(1 for m, _ in rows if m >= T), sum(1 for m, c in rows if c and m < T))
+    return out
+
+
+def rv_er(m, T=2):
+    w, l = m[T]
+    return (w * T - l) / float(w + l) if w + l else None
+
+
+def rv_txt(m, T=2):
+    w, l = m[T]
+    if w + l == 0:
+        return "N=%-3d sin resolver" % m["n"]
+    return "N=%-3d gana %3.0f%% R/op %+.2f" % (w + l, 100.0 * w / (w + l), (w * T - l) / float(w + l))
+
+
+def run_lab():
+    """LABORATORIO: prueba filtros del Reversal Pro con velas reales. Elige SOLO con la parte de entrenamiento y
+    confirma con la parte de prueba (que el filtro no vio). Mide a 2R con el SL pegado a la mecha de la vela 1."""
+    print("LABORATORIO del indicador Reversal Pro (pico/suelo con confirmacion de 2 velas).")
+    print("Se mide a 2R, con el SL pegado a la mecha de la vela 1 y spread $%.2f incluido. 'gana' = llega a 2R antes que "
+          "al SL (si una vela toca ambos, cuenta como SL)." % BT_SPREAD)
+    print("Los filtros se ELIGEN solo con el ENTRENAMIENTO (primer %d%% del tiempo) y se CONFIRMAN en la PRUEBA (el resto), "
+          "que el filtro no vio. Un filtro que brilla en entrenamiento y se cae en prueba es suerte: no lo uses." % round(LAB_TRAIN * 100))
+    print("Con pocas operaciones (N chico) todo es ruido: fiate solo de lo que se repite en entrenamiento Y prueba, y con N >= %d."
+          % LAB_MIN_N)
+    ok_count = 0
+    for tf in TIMEFRAMES:
+        set_tf(tf)
+        windows = max(1, -(-LAB_DAYS // TF_INFO[tf]["days"]))
+        try:
+            raw = fetch_capital(tf, windows) if DATA_SOURCE == "capital" else fetch_bars(tf, True)
+        except SystemExit as e:
+            print("\n[%s] ERROR: %s" % (tf_name(), e.code))
+            continue
+        bars = clean_bars(raw, datetime.now(timezone.utc))
+        if len(bars) < 1200:
+            print("\n[%s] Muy pocas velas utiles (%d) para un laboratorio serio." % (tf_name(), len(bars)))
+            continue
+        ok_count += 1
+        n = len(bars)
+        cut = BT_WARMUP + int((n - BT_WARMUP) * LAB_TRAIN)
+        F = rv_features(bars)
+        semanas = (bars[-1]["t"] - bars[BT_WARMUP]["t"]).total_seconds() / (7 * 86400.0)
+        print()
+        print("=== %s | %d velas | %s -> %s (hora Ecuador) | fuente %s ===" % (
+            tf_name(), n, fmt_t(bars[0]["t"]), fmt_t(bars[-1]["t"]), source_label()))
+        print("    entrenamiento: %s -> %s | prueba: %s -> %s" % (
+            fmt_t(bars[BT_WARMUP]["t"]), fmt_t(bars[cut - 1]["t"]), fmt_t(bars[cut]["t"]), fmt_t(bars[-1]["t"])))
+
+        def evaluar(cfg):
+            sg = rv_signals(bars, F, cfg)
+            return sg, rv_eval(bars, sg, BT_WARMUP, cut), rv_eval(bars, sg, cut, n)
+
+        base_sg, base_tr, base_te = evaluar(RV_BASE)
+        print("  BASE (el indicador como esta hoy)   ENTRENAMIENTO: %s | PRUEBA: %s | %.1f senales/semana"
+              % (rv_txt(base_tr), rv_txt(base_te), len(base_sg) / max(semanas, 0.1)))
+        print("  (a 2R se necesita ganar mas del 33% para no perder, sin contar costos ni spread)")
+        print("  --- cada filtro solo, sobre la base ---")
+        filas = []
+        for fam, nombre, patch in RV_VARIANTS:
+            cfg = dict(RV_BASE, **patch)
+            sg, tr, te = evaluar(cfg)
+            filas.append((rv_er(tr) if rv_er(tr) is not None else -9, nombre, tr, te, len(sg)))
+        for er, nombre, tr, te, ns in sorted(filas, key=lambda x: -x[0]):
+            print("   + %-62s ENTRENAMIENTO: %s | PRUEBA: %s | %.1f/sem" % (nombre, rv_txt(tr), rv_txt(te), ns / max(semanas, 0.1)))
+
+        # ---- combinacion paso a paso, elegida solo con el entrenamiento ----
+        print("  --- mejor combinacion, paso a paso (elegida SOLO con el entrenamiento) ---")
+        cfg = dict(RV_BASE)
+        usadas = set()
+        er_actual = rv_er(base_tr)
+        er_actual = er_actual if er_actual is not None else -9
+        for paso in range(1, 5):
+            mejor = None
+            for fam, nombre, patch in RV_VARIANTS:
+                if fam in usadas:
+                    continue
+                prueba_cfg = dict(cfg, **patch)
+                sg, tr, te = evaluar(prueba_cfg)
+                er = rv_er(tr)
+                w, l = tr[2]
+                if er is None or w + l < LAB_MIN_N:
+                    continue
+                if er > er_actual + 0.02 and (mejor is None or er > mejor[0]):
+                    mejor = (er, fam, nombre, patch, tr, te, sg)
+            if mejor is None:
+                print("   (ningun otro filtro mejora con suficientes operaciones)")
+                break
+            er_actual, fam, nombre, patch, tr, te, sg = mejor
+            cfg.update(patch)
+            usadas.add(fam)
+            print("   paso %d: + %-58s ENTRENAMIENTO: %s | PRUEBA: %s | %.1f/sem"
+                  % (paso, nombre, rv_txt(tr), rv_txt(te), len(sg) / max(semanas, 0.1)))
+        sg, tr, te = evaluar(cfg)
+        todo = rv_eval(bars, sg, BT_WARMUP, n)
+        print("  RESULTADO FINAL de la combinacion en 1R / 2R / 3R (todo el periodo):")
+        for T in (1, 2, 3):
+            print("     %dR: %s" % (T, rv_txt(todo, T)))
+        print("  PRUEBA sola (lo que el filtro no vio), a 2R: %s" % rv_txt(te))
+        cambios = {k: v for k, v in cfg.items() if v != RV_BASE[k]}
+        print("  Ajustes de esa combinacion: %s" % (cambios if cambios else "ninguno (la base ya era lo mejor)"))
+    if ok_count == 0:
+        sys.exit("No se pudo correr el laboratorio en ninguna temporalidad.")
+
+
 # ============================================================================
 # Revision de una temporalidad (modo normal)
 # ============================================================================
@@ -1526,7 +1771,7 @@ def check_timeframe(tf, now, state, raw=None):
 # ============================================================================
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", default="normal", choices=["normal", "test", "history", "velas", "capital", "noticias", "backtest"])
+    ap.add_argument("--mode", default="normal", choices=["normal", "test", "history", "velas", "capital", "noticias", "backtest", "lab"])
     ap.add_argument("--tf", type=int, default=15, choices=sorted(TF_INFO),
                     help="temporalidad en minutos para capital / history / velas (15, 30 o 60)")
     ap.add_argument("--csv", help="(pruebas) leer velas de un CSV en vez de la API")
@@ -1549,6 +1794,10 @@ def main():
 
     if args.mode == "backtest":
         run_backtest()
+        return
+
+    if args.mode == "lab":
+        run_lab()
         return
 
     if args.mode == "normal":
