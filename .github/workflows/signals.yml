@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "normal = revisar senales | test = mensaje de prueba | capital = probar conexion | history = senales del historial"
+        description: "normal = revisar senales | test = mensaje de prueba | capital = probar conexion | history = senales del historial | backtest = calcular winrate y metricas"
         type: choice
         default: normal
         options:
@@ -12,6 +12,7 @@ on:
           - test
           - capital
           - history
+          - backtest
       source:
         description: "Fuente de datos"
         type: choice
