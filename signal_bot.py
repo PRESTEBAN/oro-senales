@@ -1,20 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Oro SMC V8 Apex Lab (Perfil Frecuente Intradía) -> avisos por Telegram en M15, H1 y H4.
+Oro SMC V8 Apex Lab (Perfil Frecuente Intradía + Filtro Anti-Spread)
+Avisos por Telegram en M15, H1 y H4.
 Corre en GitHub Actions, disparado desde cron-job.org.
 
 PORT 1:1 DEL INDICADOR PINE "Oro Sniper SMC - Alpha Green V8 Apex Lab":
-  * Cero retraso: la señal se genera en la MISMA vela que produce el rechazo (vela 1).
+  * Cero retraso: señal en la MISMA vela que produce el rechazo (vela 1).
     Entrada = cierre de la vela 1 (= apertura de la vela 2).
-  * Cero repintado: solo se evalúan velas YA CERRADAS (barstate.isconfirmed).
+  * Cero repintado: solo velas YA CERRADAS (barstate.isconfirmed).
   * SL protegido al extremo: ventas -> high + 0.40 x ATR ; compras -> low - 0.40 x ATR.
   * Alerta instantánea al corte.
-
-Parámetros calibrados para operativa diaria:
-  M15 -> perfil Frecuente (mecha 0.35, cooldown 6, espacio 10 velas / 1.0 ATR, score 5, HTF 4H)
-  H1  -> perfil H1        (mecha 0.40, cooldown 7, espacio 12 velas / 0.85 ATR, score 6, HTF 4H)
-  H4  -> perfil H4+       (mecha 0.40, cooldown 10, espacio 18 velas / 1.1 ATR, score 6, HTF DIARIO)
+  * Filtro de riesgo mínimo monetario ($3.50) para absorber el spread en 1:1.
 """
 import argparse
 import csv
@@ -155,6 +152,7 @@ DEAD_SESS = parse_session("17:00-20:00")
 SL_BUFFER = 0.40
 MIN_SL_ATR = 0.70
 MAX_RISK_ATR = 3.2
+MIN_RISK_USD = 3.50  # Distancia mínima al SL para neutralizar el spread en 1:1
 USE_FVG_TRIG = env_bool("USE_FVG_TRIG", True)
 USE_SQUEEZE = env_bool("USE_SQUEEZE", True)
 
@@ -170,8 +168,7 @@ BRK_IDX = RR_NAMES.index(BT_RR)
 
 
 def profile(tf):
-    """Perfil temporal automático: M15 calibrado para operativa diaria frecuente."""
-    if tf == 15:          # M15 Frecuente
+    if tf == 15:
         return dict(
             name="M15 Frecuente",
             htf="240",
@@ -183,7 +180,7 @@ def profile(tf):
             adx_min=ADX_MIN,
             vol=VOL_MULT,
         )
-    if 60 <= tf < 240:    # H1
+    if 60 <= tf < 240:
         return dict(
             name="H1",
             htf="240",
@@ -195,7 +192,6 @@ def profile(tf):
             adx_min=13.0,
             vol=VOL_MULT,
         )
-    # H4 o superior
     return dict(
         name="H4+",
         htf="D",
@@ -473,7 +469,6 @@ def sma_seq(src, n):
 
 
 def build_context(bars, htf):
-    """Calcula HTF EMA50 y PDH/PDL idéntico a request.security(..., lookahead_on)."""
     n = len(bars)
     htf_cl = [None] * n
     htf_ema = [None] * n
@@ -522,7 +517,7 @@ def build_context(bars, htf):
 
 
 # ============================================================================
-# Motor de Señales V8 Apex Lab (Perfil Frecuente)
+# Motor de Señales V8 Apex Lab (Perfil Frecuente + Filtro Anti-Spread)
 # ============================================================================
 def run_v8(bars):
     prof = profile(TF)
@@ -731,8 +726,9 @@ def run_v8(bars):
             sl_b = c - MIN_SL_ATR * a
         risk_b = c - sl_b
 
-        sell_sig = sell_ready and 0 < risk_s <= MAX_RISK_ATR * a
-        buy_sig = buy_ready and 0 < risk_b <= MAX_RISK_ATR * a
+        # Exigir riesgo monetario mínimo (>= $3.50) para absorber el spread en 1:1
+        sell_sig = sell_ready and (0 < risk_s <= MAX_RISK_ATR * a) and (risk_s >= MIN_RISK_USD)
+        buy_sig = buy_ready and (0 < risk_b <= MAX_RISK_ATR * a) and (risk_b >= MIN_RISK_USD)
 
         if sell_sig:
             last_bar, last_px = i, c
@@ -952,7 +948,7 @@ def exp_r(sr, n):
 
 
 def run_backtest():
-    print("MEDIDOR V8 Apex Lab (Perfil Frecuente: M15, H1, H4).")
+    print("MEDIDOR V8 Apex Lab (Perfil Frecuente + Filtro Anti-Spread).")
     for tf in TIMEFRAMES:
         set_tf(tf)
         try:
@@ -1050,7 +1046,7 @@ def main():
     now = datetime.now(timezone.utc)
 
     if args.mode == "test":
-        ok = send_telegram("✅ <b>Bot Oro V8 Apex (Frecuente) Conectado</b>\nTelegram funcionando.")
+        ok = send_telegram("✅ <b>Bot Oro V8 Apex (Anti-Spread) Conectado</b>\nTelegram funcionando.")
         print("Mensaje de prueba enviado" if ok else "Fallo al enviar")
         return
 
