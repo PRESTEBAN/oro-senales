@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Oro SMC V8 Apex Lab -> avisos por Telegram en M15, H1 y H4.
+Oro SMC V8 Apex Lab (Perfil Frecuente Intradía) -> avisos por Telegram en M15, H1 y H4.
 Corre en GitHub Actions, disparado desde cron-job.org.
 
 PORT 1:1 DEL INDICADOR PINE "Oro Sniper SMC - Alpha Green V8 Apex Lab":
@@ -11,10 +11,10 @@ PORT 1:1 DEL INDICADOR PINE "Oro Sniper SMC - Alpha Green V8 Apex Lab":
   * SL protegido al extremo: ventas -> high + 0.40 x ATR ; compras -> low - 0.40 x ATR.
   * Alerta instantánea al corte.
 
-Temporalidades soportadas:
-  M15 -> perfil base (mecha 0.40, cooldown 10, espacio 18 velas / 1.1 ATR, ADX min 16, HTF 4H)
-  H1  -> perfil H1   (mecha 0.40, cooldown 7,  espacio 12 velas / 0.85 ATR, ADX min 13, HTF 4H)
-  H4  -> perfil H4+  (mecha 0.40, cooldown 10, espacio 18 velas / 1.1 ATR, ADX min 18, HTF DIARIO)
+Parámetros calibrados para operativa diaria:
+  M15 -> perfil Frecuente (mecha 0.35, cooldown 6, espacio 10 velas / 1.0 ATR, score 5, HTF 4H)
+  H1  -> perfil H1        (mecha 0.40, cooldown 7, espacio 12 velas / 0.85 ATR, score 6, HTF 4H)
+  H4  -> perfil H4+       (mecha 0.40, cooldown 10, espacio 18 velas / 1.1 ATR, score 6, HTF DIARIO)
 """
 import argparse
 import csv
@@ -73,11 +73,11 @@ def env_bool(name, default):
 
 
 TIMEFRAMES = parse_timeframes(os.getenv("TIMEFRAMES", "15,60,240"))
-DATA_SOURCE = os.getenv("DATA_SOURCE", "capital").strip().lower()   # capital | twelvedata
+DATA_SOURCE = os.getenv("DATA_SOURCE", "capital").strip().lower()
 SYMBOL = os.getenv("SYMBOL", "XAU/USD")
 OUTPUTSIZE = int(os.getenv("OUTPUTSIZE", "5000"))
 CAPITAL_EPIC = os.getenv("CAPITAL_EPIC", "GOLD")
-CAPITAL_PRICE = os.getenv("CAPITAL_PRICE", "bid").strip().lower()      # bid | mid | ask
+CAPITAL_PRICE = os.getenv("CAPITAL_PRICE", "bid").strip().lower()
 CAPITAL_HOSTS = {
     "demo": "https://demo-api-capital.backend-capital.com",
     "live": "https://api-capital.backend-capital.com",
@@ -136,12 +136,7 @@ USE_PDH = True
 USE_ASIA = True
 ASIA_SESS = parse_session("20:00-24:00")
 PD_LEN = 100
-MIN_WICK = 0.40
 MIN_RANGE_ATR = 0.55
-COOLDOWN = 10
-SPACE_ATR = 1.1
-SPACE_BARS = 18
-MIN_SCORE = 6
 HTF_LEN = 50
 EMA_LEN = 20
 BB_LEN = 20
@@ -175,38 +170,41 @@ BRK_IDX = RR_NAMES.index(BT_RR)
 
 
 def profile(tf):
-    """Perfil temporal automático del Pine Script V8 Apex."""
+    """Perfil temporal automático: M15 calibrado para operativa diaria frecuente."""
+    if tf == 15:          # M15 Frecuente
+        return dict(
+            name="M15 Frecuente",
+            htf="240",
+            wick=0.35,
+            cooldown=6,
+            space_bars=10,
+            space_atr=1.0,
+            min_score=5,
+            adx_min=ADX_MIN,
+            vol=VOL_MULT,
+        )
     if 60 <= tf < 240:    # H1
         return dict(
             name="H1",
             htf="240",
-            wick=MIN_WICK,
+            wick=0.40,
             cooldown=7,
             space_bars=12,
             space_atr=0.85,
+            min_score=6,
             adx_min=13.0,
             vol=VOL_MULT,
         )
-    if tf >= 240:         # H4 o superior
-        return dict(
-            name="H4+",
-            htf="D",
-            wick=MIN_WICK,
-            cooldown=COOLDOWN,
-            space_bars=SPACE_BARS,
-            space_atr=SPACE_ATR,
-            adx_min=ADX_MIN_H4,
-            vol=VOL_MULT,
-        )
-    # M15 (base)
+    # H4 o superior
     return dict(
-        name="base",
-        htf="240",
-        wick=MIN_WICK,
-        cooldown=COOLDOWN,
-        space_bars=SPACE_BARS,
-        space_atr=SPACE_ATR,
-        adx_min=ADX_MIN,
+        name="H4+",
+        htf="D",
+        wick=0.40,
+        cooldown=10,
+        space_bars=18,
+        space_atr=1.1,
+        min_score=6,
+        adx_min=ADX_MIN_H4,
         vol=VOL_MULT,
     )
 
@@ -524,7 +522,7 @@ def build_context(bars, htf):
 
 
 # ============================================================================
-# Motor de Señales V8 Apex Lab
+# Motor de Señales V8 Apex Lab (Perfil Frecuente)
 # ============================================================================
 def run_v8(bars):
     prof = profile(TF)
@@ -698,7 +696,7 @@ def run_v8(bars):
 
         sell_ready = (
             (bear_classic or (USE_FVG_TRIG and bear_fvg))
-            and ev_bear >= MIN_SCORE
+            and ev_bear >= prof["min_score"]
             and htf_bear
             and test_ema_bear
             and not (ANTI_IMP and strong_up)
@@ -711,7 +709,7 @@ def run_v8(bars):
         )
         buy_ready = (
             (bull_classic or (USE_FVG_TRIG and bull_fvg))
-            and ev_bull >= MIN_SCORE
+            and ev_bull >= prof["min_score"]
             and htf_bull
             and test_ema_bull
             and not (ANTI_IMP and strong_dn)
@@ -954,7 +952,7 @@ def exp_r(sr, n):
 
 
 def run_backtest():
-    print("MEDIDOR V8 Apex Lab (M15, H1, H4) idéntico a Pine Script.")
+    print("MEDIDOR V8 Apex Lab (Perfil Frecuente: M15, H1, H4).")
     for tf in TIMEFRAMES:
         set_tf(tf)
         try:
@@ -1052,7 +1050,7 @@ def main():
     now = datetime.now(timezone.utc)
 
     if args.mode == "test":
-        ok = send_telegram("✅ <b>Bot Oro V8 Apex (M15 / H1 / H4) Conectado</b>\nTelegram funcionando.")
+        ok = send_telegram("✅ <b>Bot Oro V8 Apex (Frecuente) Conectado</b>\nTelegram funcionando.")
         print("Mensaje de prueba enviado" if ok else "Fallo al enviar")
         return
 
