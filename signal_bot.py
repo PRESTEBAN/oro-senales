@@ -475,7 +475,7 @@ def sma_seq(src, n):
 
 
 def build_context(bars, htf):
-    """Calcula HTF EMA50 y PDH/PDL con lookahead_on [1] (cierre confirmado anterior)."""
+    """Calcula HTF EMA50 y PDH/PDL idéntico a request.security(..., lookahead_on)."""
     n = len(bars)
     htf_cl = [None] * n
     htf_ema = [None] * n
@@ -486,8 +486,7 @@ def build_context(bars, htf):
     cur_k = None
     cur_close = None
     prev_close = None
-    prev_ema = None
-    closes = []
+    ema_val = None
     cur_day = None
     cur_hi = cur_lo = None
     prev_hi = prev_lo = None
@@ -500,15 +499,15 @@ def build_context(bars, htf):
         if k_h != cur_k:
             if cur_k is not None:
                 prev_close = cur_close
-                closes.append(prev_close)
-                if len(closes) == HTF_LEN:
-                    prev_ema = sum(closes) / HTF_LEN
-                elif len(closes) > HTF_LEN:
-                    prev_ema = alpha * prev_close + (1 - alpha) * prev_ema
+                if ema_val is None:
+                    ema_val = prev_close
+                else:
+                    ema_val = alpha * prev_close + (1.0 - alpha) * ema_val
             cur_k = k_h
+
         cur_close = b["c"]
         htf_cl[i] = prev_close
-        htf_ema[i] = prev_ema
+        htf_ema[i] = ema_val
 
         if k_day != cur_day:
             if cur_day is not None:
@@ -520,6 +519,7 @@ def build_context(bars, htf):
             cur_lo = min(cur_lo, b["l"])
         pdh[i] = prev_hi
         pdl[i] = prev_lo
+
     return htf_cl, htf_ema, pdh, pdl
 
 
