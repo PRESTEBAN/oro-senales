@@ -1,27 +1,33 @@
-name: Senales Oro V8 Apex
+name: Senales oro
 
+# El horario NO lo da GitHub (su "schedule" se atrasaba horas): lo da cron-job.org,
+# que llama a este workflow con workflow_dispatch.
+# Para cero retraso, programa cron-job.org para disparar UN POCO ANTES del cierre de cada vela de 15 min
+# (minutos :13, :28, :43 y :58). El bot espera al cierre exacto + 3 s y avisa en ese instante.
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "normal = revisar senales | test = mensaje de prueba | capital = probar conexion | history = senales del historial | backtest = calcular winrate y metricas"
+        description: "normal = revisar senales V8 | test = mensaje de prueba de Telegram | capital = probar conexion con Capital.com | noticias = noticias rojas de USD de la semana | backtest = medidor identico al del Pine | history = senales del historial | velas = ultimas velas para comparar"
         type: choice
-        default: normal
+        default: capital
         options:
-          - normal
-          - test
           - capital
-          - history
+          - test
           - backtest
+          - noticias
+          - velas
+          - history
+          - normal
       source:
-        description: "Fuente de datos"
+        description: "Fuente de datos para esta corrida manual"
         type: choice
         default: capital
         options:
           - capital
           - twelvedata
       tf:
-        description: "Temporalidad individual (15, 60, 240). El modo normal revisa las 3."
+        description: "Temporalidad para capital / velas / history (en minutos: 15 = M15, 60 = H1, 240 = H4). El modo normal revisa las tres."
         type: choice
         default: "15"
         options:
@@ -42,12 +48,15 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
+
       - name: Instalar dependencias
         run: pip install -r requirements.txt
+
       - name: Revisar senales
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
@@ -57,19 +66,24 @@ jobs:
           CAPITAL_IDENTIFIER: ${{ secrets.CAPITAL_IDENTIFIER }}
           CAPITAL_PASSWORD: ${{ secrets.CAPITAL_PASSWORD }}
           CAPITAL_ENV: ${{ vars.CAPITAL_ENV }}
-          DATA_SOURCE: ${{ github.event.inputs.source || vars.DATA_SOURCE || 'capital' }}
+          DATA_SOURCE: ${{ github.event.inputs.source || vars.DATA_SOURCE || 'twelvedata' }}
           TIMEFRAMES: ${{ vars.TIMEFRAMES || '15,60,240' }}
           CLOSE_MARGIN_S: ${{ vars.CLOSE_MARGIN_S || '3' }}
+          LOOKBACK_BARS: ${{ vars.LOOKBACK_BARS || '1' }}
+          MAX_AGE_MIN: ${{ vars.MAX_AGE_MIN || '10' }}
+          USE_FVG_TRIG: ${{ vars.USE_FVG_TRIG || '1' }}
+          USE_SQUEEZE: ${{ vars.USE_SQUEEZE || '1' }}
           MODE: ${{ github.event.inputs.mode || 'normal' }}
           TF: ${{ github.event.inputs.tf || '15' }}
         run: python signal_bot.py --mode "$MODE" --tf "$TF"
+
       - name: Guardar estado
         run: |
           if [ -n "$(git status --porcelain state.json)" ]; then
             git config user.name "signal-bot"
             git config user.email "signal-bot@users.noreply.github.com"
             git add state.json
-            git commit -m "update state"
+            git commit -m "estado de avisos"
             git pull --rebase origin main
             git push
           fi
