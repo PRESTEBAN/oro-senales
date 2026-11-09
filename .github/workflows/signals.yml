@@ -75,6 +75,8 @@ jobs:
           MAX_AGE_H4: ${{ vars.MAX_AGE_H4 || '30' }}
           USE_FVG_TRIG: ${{ vars.USE_FVG_TRIG || '1' }}
           USE_SQUEEZE: ${{ vars.USE_SQUEEZE || '1' }}
+          H4_SOURCE: ${{ vars.H4_SOURCE || 'h1' }}
+          H4_ANCHOR: ${{ vars.H4_ANCHOR || '18' }}
           MODE: ${{ github.event.inputs.mode || 'normal' }}
           TF: ${{ github.event.inputs.tf || '15' }}
         run: python signal_bot.py --mode "$MODE" --tf "$TF"
