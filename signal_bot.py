@@ -22,14 +22,14 @@ Filtro anti-spread: riesgo minimo de $3.50 (evita microvelas donde el spread des
 
 Killzone y noticias rojas de USD SOLO se informan en el mensaje; nunca filtran senales.
 
-Modos:  python signal_bot.py --mode normal    (el de siempre: revisa M15, M30 y H1)
+Modos:  python signal_bot.py --mode normal    (el de siempre: revisa M15, H1 y H4)
         python signal_bot.py --mode test      (manda un mensaje de prueba)
-        python signal_bot.py --mode capital   [--tf 15|30|60]  (prueba la conexion e imprime velas)
+        python signal_bot.py --mode capital   [--tf 15|60|240]  (prueba la conexion e imprime velas)
         python signal_bot.py --mode noticias  (noticias rojas de USD de la semana)
         python signal_bot.py --mode backtest  (medidor identico al del Pine: 1:1, 1:1.5, 1:2, 1:3,
                                                desglose, mitades, IC95 y punto de equilibrio)
-        python signal_bot.py --mode history   [--tf 15|30|60]  (senales del historial descargado)
-        python signal_bot.py --mode velas     [--tf 15|30|60]  (ultimas velas con sus marcas)
+        python signal_bot.py --mode history   [--tf 15|60|240]  (senales del historial descargado)
+        python signal_bot.py --mode velas     [--tf 15|60|240]  (ultimas velas con sus marcas)
 Secrets: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
          CAPITAL_API_KEY, CAPITAL_IDENTIFIER, CAPITAL_PASSWORD   (si usas Capital.com)
          TWELVEDATA_KEY                                          (si usas Twelve Data)
@@ -42,6 +42,7 @@ import math
 import os
 import sys
 import time
+import traceback
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -112,8 +113,10 @@ if CAPITAL_PRICE not in ("bid", "mid", "ask"):
 
 # Cero retraso: solo se avisa la vela que ACABA de cerrar (LOOKBACK 1) y, si el aviso se atrasa mas de
 # MAX_AGE_MIN minutos (cola de GitHub, feed lento), se descarta: la entrada ya no seria la apertura de la vela 2.
-LOOKBACK_BARS = int(os.getenv("LOOKBACK_BARS", "1"))
-MAX_AGE_MIN = float(os.getenv("MAX_AGE_MIN", "10"))
+LOOKBACK_BARS = int(os.getenv("LOOKBACK_BARS", "2"))     # se miran las 2 ultimas velas; el filtro de edad decide
+MAX_AGE_MIN = float(os.getenv("MAX_AGE_MIN", "10"))      # M15
+# H1 y H4 toleran mas retraso: si la corrida de justo-al-cierre no vio la vela, la siguiente (15 min despues) la rescata.
+MAX_AGE_BY_TF = {15: MAX_AGE_MIN, 60: float(os.getenv("MAX_AGE_H1", "20")), 240: float(os.getenv("MAX_AGE_H4", "30"))}
 CLOSE_MARGIN_S = float(os.getenv("CLOSE_MARGIN_S", "3"))
 MAX_WAIT_S = float(os.getenv("MAX_WAIT_S", "100"))
 FRESH_RETRIES = int(os.getenv("FRESH_RETRIES", "3"))     # reintentos si la vela recien cerrada aun no llega del feed
@@ -1093,6 +1096,32 @@ def expected_last_open(now):
     return datetime.fromtimestamp((now.timestamp() // step) * step - step, timezone.utc)
 
 
+def next_bar_missing(bars, now):
+    """True si, segun la cadencia real del feed (ultima vela + duracion), la vela que acaba de cerrar
+    todavia no llego. Funciona igual en M15, H1 y H4 aunque Capital alinee H4 distinto a la rejilla UTC.
+    Solo cuenta en los 20 min posteriores al cierre esperado (despues ya seria otro motivo: pausa, fin de semana)."""
+    if not bars:
+        return False
+    nxt = bars[-1]["t"] + BAR                       # apertura de la vela siguiente
+    close_exp = nxt + BAR                           # su cierre esperado
+    if now < close_exp or now > close_exp + timedelta(minutes=20):
+        return False
+    return market_open(nxt) and nxt.astimezone(NY).hour != 17
+
+
+def notify_error(state, errors):
+    """Avisa por Telegram si una temporalidad no se pudo revisar (maximo 1 aviso por hora)."""
+    last = state.get("err_ts")
+    if last and time.time() - last < 3600:
+        return
+    text = "\u26A0\uFE0F El bot no pudo revisar: " + " | ".join(errors)[:600] + "\nLas demas temporalidades si se revisaron. Mira el log de GitHub Actions."
+    try:
+        if send_telegram(text):
+            state["err_ts"] = time.time()
+    except SystemExit:
+        pass
+
+
 def check_timeframe(tf, now, state, raw=None):
     """Revisa una temporalidad y manda el aviso de la vela que ACABA de cerrar. True si hubo avisos."""
     set_tf(tf)
@@ -1104,14 +1133,13 @@ def check_timeframe(tf, now, state, raw=None):
         now = raw[-1]["t"] + timedelta(days=1)     # (pruebas con CSV)
     bars = clean_bars(raw, now)
 
-    # Cero retraso: si la vela recien cerrada todavia no llego del feed, reintenta rapido unos segundos.
-    if live and TF < 240:    # H4: la rejilla de Capital puede no coincidir con la UTC; no se reintenta
-        exp = expected_last_open(now)
-        for _ in range(FRESH_RETRIES):
-            ny_h = exp.astimezone(NY).hour
-            if not market_open(exp) or ny_h == 17 or (bars and bars[-1]["t"] >= exp):
+    # Cero retraso: si la vela recien cerrada todavia no llego del feed, reintenta unos segundos.
+    if live:
+        retries = FRESH_RETRIES if TF < 240 else FRESH_RETRIES * 3     # H4: el feed tarda mas en cerrar la vela
+        for _ in range(retries):
+            if not next_bar_missing(bars, now):
                 break
-            print("[%s] La vela %s aun no llega del feed; reintento en 3 s." % (name, fmt_t(exp)))
+            print("[%s] La vela que acaba de cerrar aun no llega del feed; reintento en 3 s." % name)
             time.sleep(3)
             try:
                 raw = dedupe_sorted(raw + fetch_latest(tf))
@@ -1131,6 +1159,13 @@ def check_timeframe(tf, now, state, raw=None):
 
     sigs = run_v8(bars)
     n = len(bars)
+    if sigs:
+        ls = sigs[-1]
+        print("[%s] Ultima senal del historial: %s %s (vela cerrada %s hora Ecuador, hace %.0f min)"
+              % (name, ls["side"], "clasico" if ls["trig"] == 0 else "FVG", fmt_t(bars[ls["i"]]["t"] + BAR),
+                 (now - (bars[ls["i"]]["t"] + BAR)).total_seconds() / 60.0))
+    else:
+        print("[%s] El historial descargado no tiene ninguna senal (revisa que haya historia suficiente)." % name)
     fresh = [s for s in sigs if s["i"] >= n - LOOKBACK_BARS]
     changed = False
     if not fresh:
@@ -1141,7 +1176,7 @@ def check_timeframe(tf, now, state, raw=None):
             print("[%s] Ya avisada: %s" % (name, key))
             continue
         age = (now - (bars[s["i"]]["t"] + BAR)).total_seconds() / 60.0
-        if age > MAX_AGE_MIN:
+        if age > MAX_AGE_BY_TF[tf]:
             print("[%s] Senal %s demasiado vieja (%.1f min): la entrada ya no seria la apertura de la vela siguiente."
                   % (name, key, age))
             continue
@@ -1198,10 +1233,17 @@ def main():
                 if check_timeframe(tf, now, state):
                     save_state(state)
                 ok_count += 1
-            except SystemExit as e:
-                msg = str(e.code) if e.code is not None else "error"
+            except (SystemExit, Exception) as e:
+                if isinstance(e, SystemExit):
+                    msg = str(e.code) if e.code is not None else "error"
+                else:
+                    msg = "%s: %s" % (type(e).__name__, e)
+                    traceback.print_exc()
                 print("[%s] ERROR: %s" % (TF_INFO[tf]["name"], msg))
                 errors.append("%s: %s" % (TF_INFO[tf]["name"], msg))
+        if errors:
+            notify_error(state, errors)
+            save_state(state)
         if ok_count == 0:
             sys.exit("Ninguna temporalidad pudo revisarse. " + " | ".join(errors))
         if errors:
