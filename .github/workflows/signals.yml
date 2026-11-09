@@ -66,11 +66,13 @@ jobs:
           CAPITAL_IDENTIFIER: ${{ secrets.CAPITAL_IDENTIFIER }}
           CAPITAL_PASSWORD: ${{ secrets.CAPITAL_PASSWORD }}
           CAPITAL_ENV: ${{ vars.CAPITAL_ENV }}
-          DATA_SOURCE: ${{ github.event.inputs.source || vars.DATA_SOURCE || 'twelvedata' }}
+          DATA_SOURCE: ${{ github.event.inputs.source || vars.DATA_SOURCE || 'capital' }}
           TIMEFRAMES: ${{ vars.TIMEFRAMES || '15,60,240' }}
           CLOSE_MARGIN_S: ${{ vars.CLOSE_MARGIN_S || '3' }}
-          LOOKBACK_BARS: ${{ vars.LOOKBACK_BARS || '1' }}
+          LOOKBACK_BARS: ${{ vars.LOOKBACK_BARS || '2' }}
           MAX_AGE_MIN: ${{ vars.MAX_AGE_MIN || '10' }}
+          MAX_AGE_H1: ${{ vars.MAX_AGE_H1 || '20' }}
+          MAX_AGE_H4: ${{ vars.MAX_AGE_H4 || '30' }}
           USE_FVG_TRIG: ${{ vars.USE_FVG_TRIG || '1' }}
           USE_SQUEEZE: ${{ vars.USE_SQUEEZE || '1' }}
           MODE: ${{ github.event.inputs.mode || 'normal' }}
@@ -78,6 +80,7 @@ jobs:
         run: python signal_bot.py --mode "$MODE" --tf "$TF"
 
       - name: Guardar estado
+        if: always()
         run: |
           if [ -n "$(git status --porcelain state.json)" ]; then
             git config user.name "signal-bot"
@@ -85,5 +88,5 @@ jobs:
             git add state.json
             git commit -m "estado de avisos"
             git pull --rebase origin main
-            git push
+            git push || (git pull --rebase origin main && git push)
           fi
