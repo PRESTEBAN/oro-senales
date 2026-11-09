@@ -252,7 +252,9 @@ def dedupe_sorted(bars):
     bars.sort(key=lambda b: b["t"])
     out = []
     for b in bars:
-        if not out or b["t"] > out[-1]["t"]:
+        if out and b["t"] == out[-1]["t"]:
+            out[-1] = b            # la copia mas nueva de la vela (la ultima descargada) reemplaza a la vieja
+        elif not out or b["t"] > out[-1]["t"]:
             out.append(b)
     return out
 
@@ -397,7 +399,47 @@ def fetch_capital(tf, windows):
     return bars
 
 
+H4_SOURCE = os.getenv("H4_SOURCE", "h1").strip().lower()     # api = velas H4 de Capital | h1 = armadas desde H1
+H4_ANCHOR = int(os.getenv("H4_ANCHOR", "18"))                  # hora NY en que abre una vela H4 (18 -> 18,22,02,06,10,14)
+if H4_SOURCE not in ("api", "h1"):
+    sys.exit("H4_SOURCE debe ser api o h1")
+
+
+def aggregate_h4(h1, now=None):
+    """Arma velas H4 a partir de velas H1, con la rejilla anclada a H4_ANCHOR (hora de Nueva York).
+    Descarta el primer bloque si empezo incompleto y los bloques recien cerrados a los que aun les falta la ultima H1."""
+    now = now or datetime.now(timezone.utc)
+    blocks, order = {}, []
+    for b in h1:
+        loc = b["t"].astimezone(NY) - timedelta(hours=H4_ANCHOR)
+        k = (loc.year, loc.month, loc.day, loc.hour // 4)
+        if k not in blocks:
+            start = (datetime(loc.year, loc.month, loc.day, (loc.hour // 4) * 4, tzinfo=NY)
+                     + timedelta(hours=H4_ANCHOR)).astimezone(timezone.utc)
+            blocks[k] = dict(t=start, o=b["o"], h=b["h"], l=b["l"], c=b["c"], v=b["v"], last=b["t"], first=b["t"])
+            order.append(k)
+        else:
+            x = blocks[k]
+            x["h"], x["l"], x["c"], x["v"], x["last"] = max(x["h"], b["h"]), min(x["l"], b["l"]), b["c"], x["v"] + b["v"], b["t"]
+    out = []
+    for n_, k in enumerate(order):
+        x = blocks[k]
+        end = x["t"] + timedelta(hours=4)
+        if n_ == 0 and x["first"] > x["t"] + timedelta(minutes=1):
+            continue                                           # primer bloque incompleto (corte de la descarga)
+        exp_last = end - timedelta(hours=1)                    # ultima H1 que debe existir en el bloque
+        if exp_last.astimezone(NY).hour == 17 or not market_open(exp_last):
+            exp_last -= timedelta(hours=1)                     # pausa diaria 17-18 NY / cierre semanal: no hay H1 esa hora
+        if x["last"] < exp_last and now < end + timedelta(minutes=30):
+            continue                                           # recien cerrada y aun falta su ultima hora
+        out.append(dict(t=x["t"], o=x["o"], h=x["h"], l=x["l"], c=x["c"], v=x["v"]))
+    return out
+
+
 def fetch_bars(tf, extended=False):
+    if tf == 240 and H4_SOURCE == "h1":
+        raw = fetch_capital(60, 11 if extended else 5) if DATA_SOURCE == "capital" else fetch_twelvedata(60)
+        return aggregate_h4(raw)
     if DATA_SOURCE == "capital":
         w = max(TF_INFO[tf]["win"], WINDOWS_EXTENDED) if extended else TF_INFO[tf]["win"]
         return fetch_capital(tf, w)
@@ -406,6 +448,8 @@ def fetch_bars(tf, extended=False):
 
 def fetch_latest(tf):
     """Descarga rapida (solo el tramo mas reciente) para reintentar si la ultima vela aun no llego."""
+    if tf == 240 and H4_SOURCE == "h1":
+        return aggregate_h4(fetch_capital(60, 1) if DATA_SOURCE == "capital" else fetch_twelvedata(60))
     return fetch_capital(tf, 1) if DATA_SOURCE == "capital" else fetch_twelvedata(tf)
 
 
@@ -422,7 +466,10 @@ def load_csv(path):
 
 def clean_bars(bars, now):
     """Quita velas con mercado cerrado y la vela que aun no cierra (nunca se evalua una vela abierta)."""
-    return [b for b in bars if market_open(b["t"]) and b["t"] + BAR <= now]
+    # Se conserva la vela si el mercado estaba abierto en su apertura O en su ultimo minuto (la primera vela H4 del
+    # domingo abre antes de las 17:00 NY pero ya tiene precios: antes se descartaba entera).
+    end_in = BAR - timedelta(minutes=1)
+    return [b for b in bars if (market_open(b["t"]) or market_open(b["t"] + end_in)) and b["t"] + BAR <= now]
 
 
 # ============================================================================
@@ -483,7 +530,11 @@ def build_context(bars, htf):
     for i, b in enumerate(bars):
         loc = b["t"].astimezone(NY) - timedelta(hours=17)
         k_day = (loc.year, loc.month, loc.day)
-        k_h = k_day if htf == "D" else (loc.year, loc.month, loc.day, loc.hour // 4)
+        if htf == "D":
+            k_h = k_day
+        else:
+            l4 = b["t"].astimezone(NY) - timedelta(hours=H4_ANCHOR)
+            k_h = (l4.year, l4.month, l4.day, l4.hour // 4)
 
         if k_h != cur_k:
             if cur_k is not None:          # la vela HTF anterior acaba de cerrar
@@ -943,6 +994,13 @@ def run_capital_check():
     print("hora         |   apertura    maximo     minimo     cierre     volumen")
     for b in bars[-12:]:
         print("%s | %10.2f %10.2f %10.2f %10.2f %10.0f" % (fmt_t(b["t"]), b["o"], b["h"], b["l"], b["c"], b["v"]))
+    if TF == 240:
+        agg = aggregate_h4(fetch_capital(60, 2), now)
+        print("\nH4 ARMADA DESDE H1 (ancla %d:00 NY = %s UTC en invierno). Mismas columnas:" % (H4_ANCHOR, "%02d:00" % ((H4_ANCHOR + 5) % 24)))
+        print("hora         |   apertura    maximo     minimo     cierre     volumen")
+        for b in clean_bars(agg, now)[-12:]:
+            print("%s | %10.2f %10.2f %10.2f %10.2f %10.0f" % (fmt_t(b["t"]), b["o"], b["h"], b["l"], b["c"], b["v"]))
+        print("Fuente activa para H4 en el bot: %s" % ("H1 armada" if H4_SOURCE == "h1" else "velas H4 de Capital"))
     print("\nCompara 2 o 3 de estas velas con las de tu grafico (pasa el mouse sobre la vela en TradingView).")
 
 
