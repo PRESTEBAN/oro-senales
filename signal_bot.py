@@ -120,6 +120,8 @@ MAX_AGE_MIN = float(os.getenv("MAX_AGE_MIN", "10"))      # M15
 MAX_AGE_BY_TF = {15: MAX_AGE_MIN, 60: float(os.getenv("MAX_AGE_H1", "20")), 240: float(os.getenv("MAX_AGE_H4", "30"))}
 CLOSE_MARGIN_S = float(os.getenv("CLOSE_MARGIN_S", "3"))
 MAX_WAIT_S = float(os.getenv("MAX_WAIT_S", "100"))
+VERIFY_MAX_S = float(os.getenv("VERIFY_MAX_S", "40"))      # tope de espera hasta que la vela quede FINAL
+VERIFY_STEP_S = float(os.getenv("VERIFY_STEP_S", "5"))      # cada cuantos segundos se vuelve a mirar
 VERIFY_S = float(os.getenv("VERIFY_S", "8"))              # segundos que se espera para re-verificar la senal con los datos FINALES de la vela
 FRESH_RETRIES = int(os.getenv("FRESH_RETRIES", "3"))     # reintentos si la vela recien cerrada aun no llega del feed
 
@@ -1376,6 +1378,13 @@ def next_bar_missing(bars, now):
     return market_open(nxt) and nxt.astimezone(NY).hour != 17
 
 
+def _ohlc(bars, t0):
+    for b in reversed(bars):
+        if b["t"] == t0:
+            return (round(b["o"], 2), round(b["h"], 2), round(b["l"], 2), round(b["c"], 2))
+    return None
+
+
 def notify_error(state, errors):
     """Avisa por Telegram si una temporalidad no se pudo revisar (maximo 1 aviso por hora)."""
     last = state.get("err_ts")
@@ -1450,15 +1459,34 @@ def check_timeframe(tf, now, state, raw=None):
             continue
         pend.append((s, key))
 
-    # Antes de avisar: se vuelve a bajar la vela unos segundos despues y se recalcula, para no avisar con datos
-    # provisionales (si con los datos finales la senal desaparece, no se manda).
+    # Antes de avisar: se espera a que la vela de la senal quede FINAL (Capital la entrega provisional unos segundos
+    # despues del cierre: el cierre puede cambiar ~$1). Se vuelve a bajar hasta que (1) ya no cambia y (2) ya existe la
+    # vela siguiente, y se recalcula la senal con esos datos. Si con los datos finales desaparece, NO se avisa.
     if pend and live and VERIFY_S > 0:
-        print("[%s] Verificando %d senal(es) con los datos finales de la vela (%.0f s)..." % (name, len(pend), VERIFY_S))
-        time.sleep(VERIFY_S)
+        print("[%s] Verificando %d senal(es) con los datos finales de la vela (hasta %.0f s)..." % (name, len(pend), VERIFY_MAX_S))
+        raw0, bars0, now0 = raw, bars, now
         try:
-            raw = dedupe_sorted(raw + fetch_latest(tf))
-            now = datetime.now(timezone.utc)
-            bars = clean_bars(raw, now)
+            sig_t = {key: bars[s["i"]]["t"] for s, key in pend}
+            prev = {k: _ohlc(bars, t0) for k, t0 in sig_t.items()}
+            t_start = time.time()
+            time.sleep(VERIFY_S)
+            while True:
+                raw = dedupe_sorted(raw + fetch_latest(tf))
+                now = datetime.now(timezone.utc)
+                bars = clean_bars(raw, now)
+                cur = {k: _ohlc(bars, t0) for k, t0 in sig_t.items()}
+                for k in cur:
+                    if cur[k] != prev[k] and cur[k] and prev[k]:
+                        print("[%s] La vela %s cambio al finalizar: cierre %.2f -> %.2f (max %.2f -> %.2f, min %.2f -> %.2f)"
+                              % (name, k.split("|")[-1], prev[k][3], cur[k][3], prev[k][1], cur[k][1], prev[k][2], cur[k][2]))
+                has_next = True if tf >= 240 else all(any(b["t"] >= t0 + BAR for b in raw) for t0 in sig_t.values())
+                elapsed = time.time() - t_start
+                if (cur == prev and has_next) or elapsed >= VERIFY_MAX_S:
+                    print("[%s] Vela final tras %.0f s (%s)." % (name, elapsed,
+                          "estable" if (cur == prev and has_next) else "TOPE de espera alcanzado"))
+                    break
+                prev = cur
+                time.sleep(VERIFY_STEP_S)
             n = len(bars)
             final = {state_key(x["side"], bars[x["i"]]["t"]): x for x in run_v8(bars) if x["i"] >= n - LOOKBACK_BARS}
             kept = []
@@ -1469,6 +1497,7 @@ def check_timeframe(tf, now, state, raw=None):
                     print("[%s] DESCARTADA %s: con los datos finales de la vela ya no cumple las condiciones." % (name, key))
             pend = kept
         except SystemExit as e:
+            raw, bars, now = raw0, bars0, now0
             print("[%s] No se pudo verificar (%s); se envia con los datos que ya tengo." % (name, e.code))
 
     for s, key in pend:
