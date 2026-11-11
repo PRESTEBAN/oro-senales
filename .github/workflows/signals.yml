@@ -85,6 +85,7 @@ jobs:
           H4_ANCHOR: ${{ vars.H4_ANCHOR || '18' }}
           LAB_WINDOWS: ${{ vars.LAB_WINDOWS || '24' }}
           VERIFY_S: ${{ vars.VERIFY_S || '8' }}
+          VERIFY_MAX_S: ${{ vars.VERIFY_MAX_S || '40' }}
           EXPLAIN_BARS: ${{ github.event.inputs.explain_bars || vars.EXPLAIN_BARS || '8' }}
           MODE: ${{ github.event.inputs.mode || 'normal' }}
           TF: ${{ github.event.inputs.tf || '15' }}
