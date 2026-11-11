@@ -30,6 +30,7 @@ Modos:  python signal_bot.py --mode normal    (el de siempre: revisa M15, H1 y H
                                                desglose, mitades, IC95 y punto de equilibrio)
         python signal_bot.py --mode history   [--tf 15|60|240]  (senales del historial descargado)
         python signal_bot.py --mode velas     [--tf 15|60|240]  (ultimas velas con sus marcas)
+        python signal_bot.py --mode explicar  [--tf 15|60|240]  (por que cada una de las ultimas velas dio o no senal)
 Secrets: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
          CAPITAL_API_KEY, CAPITAL_IDENTIFIER, CAPITAL_PASSWORD   (si usas Capital.com)
          TWELVEDATA_KEY                                          (si usas Twelve Data)
@@ -119,6 +120,7 @@ MAX_AGE_MIN = float(os.getenv("MAX_AGE_MIN", "10"))      # M15
 MAX_AGE_BY_TF = {15: MAX_AGE_MIN, 60: float(os.getenv("MAX_AGE_H1", "20")), 240: float(os.getenv("MAX_AGE_H4", "30"))}
 CLOSE_MARGIN_S = float(os.getenv("CLOSE_MARGIN_S", "3"))
 MAX_WAIT_S = float(os.getenv("MAX_WAIT_S", "100"))
+VERIFY_S = float(os.getenv("VERIFY_S", "8"))              # segundos que se espera para re-verificar la senal con los datos FINALES de la vela
 FRESH_RETRIES = int(os.getenv("FRESH_RETRIES", "3"))     # reintentos si la vela recien cerrada aun no llega del feed
 
 
@@ -199,6 +201,9 @@ if BT_RR not in RR_NAMES:
 BRK_IDX = RR_NAMES.index(BT_RR)
 
 
+H4_OVERRIDE = {}      # lo usa el laboratorio para probar variantes del perfil H4
+
+
 def profile(tf):
     """Perfil temporal automatico del Pine (seccion 7)."""
     if tf == 15:      # isM15
@@ -207,8 +212,10 @@ def profile(tf):
     if 60 <= tf < 240:   # isH1_H3
         return dict(name="H1", htf="240", wick=MIN_WICK, cooldown=7, space_bars=12, space_atr=0.85,
                     min_score=MIN_SCORE, adx_min=13.0, vol=VOL_MULT)
-    return dict(name="H4+", htf="D", wick=MIN_WICK, cooldown=COOLDOWN, space_bars=SPACE_BARS,
-                space_atr=SPACE_ATR, min_score=MIN_SCORE, adx_min=ADX_MIN_H4, vol=VOL_MULT)
+    p = dict(name="H4+", htf="D", wick=MIN_WICK, cooldown=COOLDOWN, space_bars=SPACE_BARS,
+             space_atr=SPACE_ATR, min_score=MIN_SCORE, adx_min=ADX_MIN_H4, vol=VOL_MULT, max_risk=MAX_RISK_ATR)
+    p.update(H4_OVERRIDE)
+    return p
 
 
 # ============================================================================
@@ -350,7 +357,7 @@ def parse_capital(prices):
     return dedupe_sorted(bars)
 
 
-def fetch_capital(tf, windows):
+def fetch_capital(tf, windows, tolerate=False):
     global CAPITAL_ENV_USED
     base, env, hdr = capital_session()
     CAPITAL_ENV_USED = env
@@ -385,6 +392,9 @@ def fetch_capital(tf, windows):
                 continue
             break
         if data is None:
+            if tolerate and k > 0:
+                print("AVISO: Capital.com no entrega mas historial de %s (tramo %d: %s). Me quedo con lo descargado." % (info["name"], k, err))
+                break
             sys.exit("Capital.com no entrego velas de %s (%s)" % (info["name"], err))
         prices = data.get("prices") or []
         if len(prices) >= 1000:
@@ -565,10 +575,11 @@ def build_context(bars, htf):
 # ============================================================================
 # MOTOR V8 APEX LAB (port 1:1 del Pine)
 # ============================================================================
-def run_v8(bars):
+def run_v8(bars, trace=None):
     """Devuelve la lista de senales. Cada senal nace en la vela i (la del rechazo), con entrada = cierre
     de esa vela y SL al extremo. No mira ninguna vela posterior."""
     prof = profile(TF)
+    max_risk = prof.get("max_risk", MAX_RISK_ATR)
     n = len(bars)
     O = [b["o"] for b in bars]
     H = [b["h"] for b in bars]
@@ -748,8 +759,45 @@ def run_v8(bars):
             sl_b = c - MIN_SL_ATR * a
         risk_b = c - sl_b
 
-        sell_sig = sell_ready and 0 < risk_s <= MAX_RISK_ATR * a and risk_s >= MIN_RISK_USD
-        buy_sig = buy_ready and 0 < risk_b <= MAX_RISK_ATR * a and risk_b >= MIN_RISK_USD
+        sell_sig = sell_ready and 0 < risk_s <= max_risk * a and risk_s >= MIN_RISK_USD
+        buy_sig = buy_ready and 0 < risk_b <= max_risk * a and risk_b >= MIN_RISK_USD
+
+        if trace is not None and i in trace:      # modo 'explicar': guarda que condicion cumple / bloquea cada lado
+            adx_s = "%.1f" % adx_i if adx_i is not None else "n/d"
+            gap = min(i - last_bar, 999)
+            trace[i] = dict(o=o, h=h, l=l, c=c, atr=a, adx=adx_s, bear=[
+                ("gatillo", bear_classic or (USE_FVG_TRIG and bear_fvg),
+                 "mecha sup %.2f (min %.2f), cuerpo %.2f (min 0.22), rango %.2f ATR (min %.2f), vela %s"
+                 % (wick_up, prof["wick"], body_pct, rng / a, MIN_RANGE_ATR, "bajista" if c < o else "NO bajista")),
+                ("puntuacion", ev_bear >= prof["min_score"], "%d de 11 (min %d)" % (ev_bear, prof["min_score"])),
+                ("tendencia HTF bajista", htf_bear, ""),
+                ("test EMA20", test_ema_bear, ""),
+                ("sin impulso alcista fuerte", not (ANTI_IMP and strong_up), "ADX %s" % adx_s),
+                ("espacio vs senal anterior", space_sell, ""),
+                ("cooldown", cool_ok, "%d velas desde la ultima senal (hace falta mas de %d)" % (gap, prof["cooldown"])),
+                ("ATR minimo", atr_ok, "ATR %.2f (min %.2f)" % (a, MIN_ATR_USD)),
+                ("ADX minimo", adx_ok, "ADX %s (min %.0f)" % (adx_s, prof["adx_min"])),
+                ("hora permitida", time_ok, ""),
+                ("filtro compresion", squeeze_ok, ""),
+                ("riesgo", 0 < risk_s <= max_risk * a and risk_s >= MIN_RISK_USD,
+                 "riesgo $%.2f (min $%.2f, max %.1f ATR = $%.2f)" % (risk_s, MIN_RISK_USD, max_risk, max_risk * a)),
+            ], bull=[
+                ("gatillo", bull_classic or (USE_FVG_TRIG and bull_fvg),
+                 "mecha inf %.2f (min %.2f), cuerpo %.2f (min 0.22), rango %.2f ATR (min %.2f), vela %s"
+                 % (wick_dn, prof["wick"], body_pct, rng / a, MIN_RANGE_ATR, "alcista" if c > o else "NO alcista")),
+                ("puntuacion", ev_bull >= prof["min_score"], "%d de 11 (min %d)" % (ev_bull, prof["min_score"])),
+                ("tendencia HTF alcista", htf_bull, ""),
+                ("test EMA20", test_ema_bull, ""),
+                ("sin impulso bajista fuerte", not (ANTI_IMP and strong_dn), "ADX %s" % adx_s),
+                ("espacio vs senal anterior", space_buy, ""),
+                ("cooldown", cool_ok, "%d velas desde la ultima senal (hace falta mas de %d)" % (gap, prof["cooldown"])),
+                ("ATR minimo", atr_ok, "ATR %.2f (min %.2f)" % (a, MIN_ATR_USD)),
+                ("ADX minimo", adx_ok, "ADX %s (min %.0f)" % (adx_s, prof["adx_min"])),
+                ("hora permitida", time_ok, ""),
+                ("filtro compresion", squeeze_ok, ""),
+                ("riesgo", 0 < risk_b <= max_risk * a and risk_b >= MIN_RISK_USD,
+                 "riesgo $%.2f (min $%.2f, max %.1f ATR = $%.2f)" % (risk_b, MIN_RISK_USD, max_risk, max_risk * a)),
+            ])
 
         if sell_sig:
             last_bar, last_px = i, c
@@ -1146,6 +1194,167 @@ def run_backtest():
         sys.exit("No se pudo medir ninguna temporalidad.")
 
 
+
+# ============================================================================
+# LABORATORIO H4: prueba variantes del perfil con el mismo motor y medidor del bot (a 1:2)
+# ============================================================================
+LAB_WINDOWS = int(os.getenv("LAB_WINDOWS", "24"))     # tramos de 35 dias de H1 (24 = ~840 dias, si Capital los entrega)
+
+H4_BASE_VALUES = dict(wick=MIN_WICK, cooldown=COOLDOWN, space_bars=SPACE_BARS, space_atr=SPACE_ATR,
+                      min_score=MIN_SCORE, adx_min=ADX_MIN_H4, max_risk=MAX_RISK_ATR)
+_ESP = dict(cooldown=6, space_bars=10, space_atr=1.0)
+LAB_VARIANTS = [
+    ("Base (actual)", {}),
+    ("Frecuente (actual)", dict(wick=0.35, min_score=5, **_ESP)),
+    ("Solo espaciado", dict(**_ESP)),
+    ("Solo puntuacion 5", dict(min_score=5)),
+    ("Solo mecha 0.35", dict(wick=0.35)),
+    ("Solo ADX 15", dict(adx_min=15.0)),
+    ("Solo riesgo max 4.0", dict(max_risk=4.0)),
+    ("Espaciado + mecha 0.35", dict(wick=0.35, **_ESP)),
+    ("Espaciado + puntuacion 5", dict(min_score=5, **_ESP)),
+    ("Espaciado + ADX 15", dict(adx_min=15.0, **_ESP)),
+    ("Espaciado + riesgo max 4.0", dict(max_risk=4.0, **_ESP)),
+]
+
+
+def lab_records(bars, sigs):
+    """(indice de vela, gano?, R, lado) de las senales YA resueltas a 1:2, con spread descontado."""
+    rr = RRS[2]
+    res = bt_measure(bars, sigs)
+    recs = []
+    for s, row in zip(sigs, res):
+        if row[2] in ("W", "L"):
+            cost = BT_SPREAD / s["risk"]
+            recs.append((s["i"], row[2] == "W", (rr - cost) if row[2] == "W" else (-1.0 - cost), s["side"]))
+    return recs
+
+
+def _avg(rs):
+    return sum(rs) / len(rs) if rs else None
+
+
+def _fmt(v):
+    return "  --  " if v is None else "%+.2f" % v
+
+
+def manual_text(ov):
+    v = dict(H4_BASE_VALUES, **ov)
+    return ("Pine > Perfil H4 = Manual: mecha %.2f | cooldown %d | espacio %d velas | %.1f ATR | puntuacion %d | ADX %.0f | riesgo max %.1f"
+            % (v["wick"], v["cooldown"], v["space_bars"], v["space_atr"], v["min_score"], v["adx_min"], v["max_risk"]))
+
+
+def run_h4lab():
+    global H4_OVERRIDE
+    set_tf(240)
+    print("LABORATORIO H4: cada variante se mide con el mismo motor y medidor que el Pine (1:2, spread $%.2f incluido)." % BT_SPREAD)
+    print("Criterio (el que acordamos): >= 1.5x las senales de Base, R total >= la de Base y R/op positiva en AMBAS mitades.")
+    try:
+        raw = fetch_capital(60, LAB_WINDOWS, tolerate=True) if DATA_SOURCE == "capital" else fetch_twelvedata(60)
+    except SystemExit as e:
+        sys.exit("No se pudo bajar el historial: %s" % e.code)
+    bars = clean_bars(aggregate_h4(raw), datetime.now(timezone.utc))
+    if len(bars) < BT_WARMUP + 100:
+        sys.exit("Muy pocas velas H4 (%d) para el laboratorio." % len(bars))
+    years = max((bars[-1]["t"] - bars[BT_WARMUP]["t"]).days / 365.0, 0.1)
+    print("Historial: %d velas H4 | %s -> %s (hora Ecuador) | %.1f anos medidos | fuente %s"
+          % (len(bars), fmt_t(bars[0]["t"]), fmt_t(bars[-1]["t"]), years, source_label()))
+    rows = []
+    for name, ov in LAB_VARIANTS:
+        H4_OVERRIDE = ov
+        sigs = [s for s in run_v8(bars) if s["i"] >= BT_WARMUP]
+        recs = lab_records(bars, sigs)
+        H4_OVERRIDE = {}
+        rs = [x[2] for x in recs]
+        if len(recs) >= 2:
+            idx = sorted(x[0] for x in recs)
+            med = (idx[len(idx) // 2] + idx[(len(idx) - 1) // 2]) / 2.0
+            h1 = [x[2] for x in recs if x[0] <= med]
+            h2 = [x[2] for x in recs if x[0] > med]
+        else:
+            h1, h2 = [], []
+        rows.append(dict(name=name, ov=ov, n=len(sigs), res=len(recs), wins=sum(1 for x in recs if x[1]),
+                         rtot=sum(rs), ravg=_avg(rs), h1=_avg(h1), h2=_avg(h2),
+                         rb=_avg([x[2] for x in recs if x[3] == "COMPRA"]),
+                         rs=_avg([x[2] for x in recs if x[3] == "VENTA"])))
+    base = rows[0]
+    print()
+    print("%-28s %5s %6s %7s %7s %7s %7s %7s %7s %7s  %s"
+          % ("Variante", "Senal", "/ano", "Acier.", "R/op", "R tot", "1a mit", "2a mit", "Compr.", "Venta", "Cumple"))
+    for r in rows:
+        ok = (r["n"] >= 1.5 * base["n"] and r["rtot"] >= base["rtot"]
+              and r["h1"] is not None and r["h2"] is not None and r["h1"] > 0 and r["h2"] > 0)
+        r["ok"] = ok
+        acc = "%5.1f%%" % (100.0 * r["wins"] / r["res"]) if r["res"] else "  --  "
+        print("%-28s %5d %6.1f %7s %7s %+7.1f %7s %7s %7s %7s  %s"
+              % (r["name"], r["n"], r["n"] / years, acc, _fmt(r["ravg"]), r["rtot"], _fmt(r["h1"]), _fmt(r["h2"]),
+                 _fmt(r["rb"]), _fmt(r["rs"]), "SI" if ok and r is not base else ("(base)" if r is base else "no")))
+    good = [r for r in rows[1:] if r["ok"]]
+    print()
+    if good:
+        best = max(good, key=lambda r: r["rtot"])
+        print("Candidatas que cumplen el criterio: %s" % ", ".join(r["name"] for r in good))
+        print("La de mayor R total: %s" % best["name"])
+        print(manual_text(best["ov"]))
+        print("Confirmala en TradingView con esos valores antes de pasarla al bot. Con pocas operaciones, una mejora pequena puede ser ruido.")
+    else:
+        print("Ninguna variante cumple el criterio con estos datos: H4 parece tener pocas senales buenas con este metodo.")
+        print("Mira las columnas 'R tot' y 'R/op': una variante que sube las senales pero deja la R total igual solo agrega operaciones, no ganancia.")
+    print("Aviso: elegir la mejor de 11 variantes sobre el mismo historial sobreestima su resultado. Tomalo como una pista, no como una prueba.")
+
+
+# ============================================================================
+# Modo EXPLICAR: por que una vela dio (o no) senal
+# ============================================================================
+def run_explain():
+    n_show = int(os.getenv("EXPLAIN_BARS", "8"))
+    raw = fetch_bars(TF, False)
+    now = datetime.now(timezone.utc)
+    bars = clean_bars(raw, now)
+    if len(bars) < 300:
+        sys.exit("Muy pocas velas utiles (%d)." % len(bars))
+    idxs = list(range(len(bars) - n_show, len(bars)))
+    trace = {i: None for i in idxs}
+    sigs = run_v8(bars, trace)
+    print("EXPLICAR %s | perfil %s | fuente %s | %d velas (el mismo largo de historial que usa el aviso en vivo)"
+          % (tf_name(), profile(TF)["name"], source_label(), len(bars)))
+    print("Para cada una de las ultimas %d velas CERRADAS: que condicion la bloquea, o SENAL si todas se cumplen." % n_show)
+    for i in idxs:
+        tr = trace[i]
+        b = bars[i]
+        head = "\n%s -> %s (hora Ecuador, apertura -> cierre)" % (fmt_t(b["t"]), fmt_t(b["t"] + BAR))
+        if tr is None:
+            print(head + " | sin datos suficientes (ATR no listo)")
+            continue
+        print(head + " | O %.2f H %.2f L %.2f C %.2f | ATR %.2f | ADX %s" % (tr["o"], tr["h"], tr["l"], tr["c"], tr["atr"], tr["adx"]))
+        if n_show > 12 and not tr["bull"][0][1] and not tr["bear"][0][1]:
+            print("  sin gatillo (mecha/FVG) ni en compra ni en venta")
+            continue
+        for side, lst in (("COMPRA", tr["bull"]), ("VENTA ", tr["bear"])):
+            fails = [x for x in lst if not x[1]]
+            if not fails:
+                print("  %s: SENAL (todas las condiciones se cumplen)" % side)
+            else:
+                print("  %s: no sale -> %s" % (side, " | ".join("%s [%s]" % (nm, det) if det else nm for nm, ok, det in fails)))
+    # el historial largo (el de history/backtest) puede dar otras senales que el corto (el del aviso en vivo)
+    try:
+        raw2 = fetch_bars(TF, True)
+    except SystemExit as e:
+        print("\n(No se pudo bajar el historial largo para comparar: %s)" % e.code)
+        return
+    bars2 = clean_bars(raw2, now)
+    cut = bars[idxs[0]]["t"]
+    a = {state_key(s["side"], bars[s["i"]]["t"]) for s in sigs if bars[s["i"]]["t"] >= cut}
+    b2 = {state_key(s["side"], bars2[s["i"]]["t"]) for s in run_v8(bars2) if bars2[s["i"]]["t"] >= cut}
+    print("\nSenales desde %s: historial del aviso (%d velas): %d | historial largo (%d velas): %d"
+          % (fmt_t(cut), len(bars), len(a), len(bars2), len(b2)))
+    if a == b2:
+        print("Ambos historiales dan las MISMAS senales.")
+    else:
+        print("DIFIEREN. Solo con historial del aviso: %s | solo con historial largo: %s"
+              % (sorted(a - b2) or "-", sorted(b2 - a) or "-"))
+
+
 # ============================================================================
 # Revision de una temporalidad (modo normal)
 # ============================================================================
@@ -1228,6 +1437,7 @@ def check_timeframe(tf, now, state, raw=None):
     changed = False
     if not fresh:
         print("[%s] Sin senales en la ultima vela cerrada." % name)
+    pend = []
     for s in fresh:
         key = state_key(s["side"], bars[s["i"]]["t"])
         if key in state["sent"]:
@@ -1238,6 +1448,31 @@ def check_timeframe(tf, now, state, raw=None):
             print("[%s] Senal %s demasiado vieja (%.1f min): la entrada ya no seria la apertura de la vela siguiente."
                   % (name, key, age))
             continue
+        pend.append((s, key))
+
+    # Antes de avisar: se vuelve a bajar la vela unos segundos despues y se recalcula, para no avisar con datos
+    # provisionales (si con los datos finales la senal desaparece, no se manda).
+    if pend and live and VERIFY_S > 0:
+        print("[%s] Verificando %d senal(es) con los datos finales de la vela (%.0f s)..." % (name, len(pend), VERIFY_S))
+        time.sleep(VERIFY_S)
+        try:
+            raw = dedupe_sorted(raw + fetch_latest(tf))
+            now = datetime.now(timezone.utc)
+            bars = clean_bars(raw, now)
+            n = len(bars)
+            final = {state_key(x["side"], bars[x["i"]]["t"]): x for x in run_v8(bars) if x["i"] >= n - LOOKBACK_BARS}
+            kept = []
+            for s, key in pend:
+                if key in final:
+                    kept.append((final[key], key))
+                else:
+                    print("[%s] DESCARTADA %s: con los datos finales de la vela ya no cumple las condiciones." % (name, key))
+            pend = kept
+        except SystemExit as e:
+            print("[%s] No se pudo verificar (%s); se envia con los datos que ya tengo." % (name, e.code))
+
+    for s, key in pend:
+        age = (now - (bars[s["i"]]["t"] + BAR)).total_seconds() / 60.0
         if send_telegram(build_message(s, bars, now)):
             state["sent"].append(key)
             changed = True
@@ -1251,7 +1486,7 @@ def check_timeframe(tf, now, state, raw=None):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", default="normal",
-                    choices=["normal", "test", "history", "velas", "capital", "noticias", "backtest"])
+                    choices=["normal", "test", "history", "velas", "capital", "noticias", "backtest", "explicar", "h4lab"])
     ap.add_argument("--tf", type=int, default=15, choices=sorted(TF_INFO),
                     help="temporalidad en minutos para capital / history / velas (15, 60 o 240)")
     ap.add_argument("--csv", help="(pruebas) leer velas de un CSV en vez de la API")
@@ -1271,6 +1506,13 @@ def main():
         return
     if args.mode == "backtest":
         run_backtest()
+        return
+    if args.mode == "explicar":
+        set_tf(args.tf)
+        run_explain()
+        return
+    if args.mode == "h4lab":
+        run_h4lab()
         return
 
     if args.mode == "normal":
