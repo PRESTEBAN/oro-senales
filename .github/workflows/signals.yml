@@ -8,16 +8,18 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "normal = revisar senales V8 | test = mensaje de prueba de Telegram | capital = probar conexion con Capital.com | noticias = noticias rojas de USD de la semana | backtest = medidor identico al del Pine | history = senales del historial | velas = ultimas velas para comparar"
+        description: "normal = revisar senales V8 | test = mensaje de prueba de Telegram | capital = probar conexion con Capital.com | noticias = noticias rojas de USD de la semana | backtest = medidor identico al del Pine | h4lab = laboratorio de variantes del perfil H4 | history = senales del historial | explicar = por que cada una de las ultimas velas dio o no senal | velas = ultimas velas para comparar"
         type: choice
         default: capital
         options:
           - capital
           - test
           - backtest
+          - h4lab
           - noticias
           - velas
           - history
+          - explicar
           - normal
       source:
         description: "Fuente de datos para esta corrida manual"
@@ -26,6 +28,10 @@ on:
         options:
           - capital
           - twelvedata
+      explain_bars:
+        description: "Solo para el modo explicar: cuantas velas cerradas revisar (8 por defecto; pon 100 para ver desde ayer)"
+        type: string
+        default: "8"
       tf:
         description: "Temporalidad para capital / velas / history (en minutos: 15 = M15, 60 = H1, 240 = H4). El modo normal revisa las tres."
         type: choice
@@ -77,6 +83,9 @@ jobs:
           USE_SQUEEZE: ${{ vars.USE_SQUEEZE || '1' }}
           H4_SOURCE: ${{ vars.H4_SOURCE || 'h1' }}
           H4_ANCHOR: ${{ vars.H4_ANCHOR || '18' }}
+          LAB_WINDOWS: ${{ vars.LAB_WINDOWS || '24' }}
+          VERIFY_S: ${{ vars.VERIFY_S || '8' }}
+          EXPLAIN_BARS: ${{ github.event.inputs.explain_bars || vars.EXPLAIN_BARS || '8' }}
           MODE: ${{ github.event.inputs.mode || 'normal' }}
           TF: ${{ github.event.inputs.tf || '15' }}
         run: python signal_bot.py --mode "$MODE" --tf "$TF"
