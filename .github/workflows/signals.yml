@@ -33,11 +33,12 @@ on:
         type: string
         default: "8"
       tf:
-        description: "Temporalidad para capital / velas / history (en minutos: 15 = M15, 60 = H1, 240 = H4). El modo normal revisa las tres."
+        description: "Temporalidad para capital / velas / history / explicar (en minutos: 15 = M15, 30 = M30, 60 = H1, 240 = H4). El modo normal revisa las cuatro."
         type: choice
         default: "15"
         options:
           - "15"
+          - "30"
           - "60"
           - "240"
 
@@ -73,14 +74,19 @@ jobs:
           CAPITAL_PASSWORD: ${{ secrets.CAPITAL_PASSWORD }}
           CAPITAL_ENV: ${{ vars.CAPITAL_ENV }}
           DATA_SOURCE: ${{ github.event.inputs.source || vars.DATA_SOURCE || 'capital' }}
-          TIMEFRAMES: ${{ vars.TIMEFRAMES || '15,60,240' }}
+          TIMEFRAMES: ${{ vars.TIMEFRAMES || '15,60,240,30' }}
           CLOSE_MARGIN_S: ${{ vars.CLOSE_MARGIN_S || '3' }}
           LOOKBACK_BARS: ${{ vars.LOOKBACK_BARS || '2' }}
           MAX_AGE_MIN: ${{ vars.MAX_AGE_MIN || '10' }}
+          MAX_AGE_M30: ${{ vars.MAX_AGE_M30 || '20' }}
           MAX_AGE_H1: ${{ vars.MAX_AGE_H1 || '20' }}
           MAX_AGE_H4: ${{ vars.MAX_AGE_H4 || '30' }}
           USE_FVG_TRIG: ${{ vars.USE_FVG_TRIG || '1' }}
           USE_SQUEEZE: ${{ vars.USE_SQUEEZE || '1' }}
+          M30_ELITE: ${{ vars.M30_ELITE || '1' }}
+          M30_MIN_SCORE: ${{ vars.M30_MIN_SCORE || '7' }}
+          M30_NEED_SWEEP: ${{ vars.M30_NEED_SWEEP || '1' }}
+          M30_NEED_KZ: ${{ vars.M30_NEED_KZ || '0' }}
           H4_SOURCE: ${{ vars.H4_SOURCE || 'h1' }}
           H4_ANCHOR: ${{ vars.H4_ANCHOR || '18' }}
           LAB_WINDOWS: ${{ vars.LAB_WINDOWS || '24' }}
