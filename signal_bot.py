@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Oro SMC V8 Apex Lab -> avisos por Telegram en M15, M30 (filtro Elite), H1 y H4.
+Oro SMC V8 Apex Lab -> avisos por Telegram en M15, H1 y H4.
 Corre en GitHub Actions, disparado desde cron-job.org.
 
 ESTE BOT ES UN PORT 1:1 DEL INDICADOR PINE "Oro Sniper SMC - Alpha Green V8 Apex Lab":
@@ -16,25 +16,21 @@ ESTE BOT ES UN PORT 1:1 DEL INDICADOR PINE "Oro Sniper SMC - Alpha Green V8 Apex
 
 Perfil temporal automatico (igual que el Pine):
   M15 -> "Frecuente" (mecha 0.35, cooldown 6, espacio 10 velas / 1.0 ATR, puntuacion minima 5, ADX min 16, HTF 4H)
-  M30 -> (mecha 0.35, cooldown 7, espacio 11 velas / 0.95 ATR, puntuacion 6, ADX min 15, HTF DIARIO)
-         + FILTRO ELITE SOLO M30: solo se avisa la senal que ademas tenga puntuacion >= M30_MIN_SCORE (7)
-           y barrido de un nivel clave (PDH/PDL, Asia o extremo de 35 velas).
   H1  -> (mecha 0.40, cooldown 7, espacio 12 velas / 0.85 ATR, puntuacion 6, ADX min 13, HTF 4H)
   H4  -> (mecha 0.40, cooldown 10, espacio 18 velas / 1.1 ATR, puntuacion 6, ADX min 18, HTF DIARIO)
 Filtro anti-spread: riesgo minimo de $3.50 (evita microvelas donde el spread destruye el 1:1).
 
-Killzone y noticias rojas de USD SOLO se informan en el mensaje; nunca filtran senales
-(salvo que actives M30_NEED_KZ=1, que solo afecta a M30).
+Killzone y noticias rojas de USD SOLO se informan en el mensaje; nunca filtran senales.
 
-Modos:  python signal_bot.py --mode normal    (el de siempre: revisa M15, H1, H4 y M30)
+Modos:  python signal_bot.py --mode normal    (el de siempre: revisa M15, H1 y H4)
         python signal_bot.py --mode test      (manda un mensaje de prueba)
-        python signal_bot.py --mode capital   [--tf 15|30|60|240]  (prueba la conexion e imprime velas)
+        python signal_bot.py --mode capital   [--tf 15|60|240]  (prueba la conexion e imprime velas)
         python signal_bot.py --mode noticias  (noticias rojas de USD de la semana)
         python signal_bot.py --mode backtest  (medidor identico al del Pine: 1:1, 1:1.5, 1:2, 1:3,
                                                desglose, mitades, IC95 y punto de equilibrio)
-        python signal_bot.py --mode history   [--tf 15|30|60|240]  (senales del historial descargado)
-        python signal_bot.py --mode velas     [--tf 15|30|60|240]  (ultimas velas con sus marcas)
-        python signal_bot.py --mode explicar  [--tf 15|30|60|240]  (por que cada una de las ultimas velas dio o no senal)
+        python signal_bot.py --mode history   [--tf 15|60|240]  (senales del historial descargado)
+        python signal_bot.py --mode velas     [--tf 15|60|240]  (ultimas velas con sus marcas)
+        python signal_bot.py --mode explicar  [--tf 15|60|240]  (por que cada una de las ultimas velas dio o no senal)
 Secrets: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
          CAPITAL_API_KEY, CAPITAL_IDENTIFIER, CAPITAL_PASSWORD   (si usas Capital.com)
          TWELVEDATA_KEY                                          (si usas Twelve Data)
@@ -61,13 +57,9 @@ EC = ZoneInfo("America/Guayaquil")
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
 
 # 'days' = tamano de cada peticion a Capital.com (max 1000 velas). 'win' = tramos en modo normal.
-# 'ext' (opcional) = tramos minimos en los modos largos (backtest/history/explicar); solo lo usa M30.
-# M30 necesita mas historia porque su filtro de tendencia es la EMA50 DIARIA (9 tramos = ~180 dias,
-# la misma historia diaria que usa H4 en vivo).
+# M30 necesita mas historia porque su filtro de tendencia es la EMA50 DIARIA.
 TF_INFO = {
     15: dict(name="M15", label="15m", res="MINUTE_15", td="15min", days=10, win=3),
-    30: dict(name="M30", label="30m", res="MINUTE_30", td="30min", days=20,
-             win=int(os.getenv("M30_WIN", "9")), ext=int(os.getenv("M30_EXT", "12"))),
     60: dict(name="H1", label="1h", res="HOUR", td="1h", days=35, win=2),
     240: dict(name="H4", label="4h", res="HOUR_4", td="4h", days=120, win=3),
 }
@@ -91,7 +83,7 @@ def parse_timeframes(text):
         if not x:
             continue
         if not x.isdigit() or int(x) not in TF_INFO:
-            sys.exit("TIMEFRAMES solo admite 15, 30, 60 y 240 (separados por coma). Recibi: %s" % text)
+            sys.exit("TIMEFRAMES solo admite 15, 60 y 240 (separados por coma). Recibi: %s" % text)
         if int(x) not in out:
             out.append(int(x))
     if not out:
@@ -103,8 +95,7 @@ def env_bool(name, default):
     return os.getenv(name, "1" if default else "0").strip() not in ("0", "false", "False", "")
 
 
-# M30 va AL FINAL del orden para no retrasar la revision de M15, H1 y H4 (su descarga es la mas larga).
-TIMEFRAMES = parse_timeframes(os.getenv("TIMEFRAMES", "15,60,240,30"))
+TIMEFRAMES = parse_timeframes(os.getenv("TIMEFRAMES", "15,60,240"))
 DATA_SOURCE = os.getenv("DATA_SOURCE", "twelvedata").strip().lower()   # capital | twelvedata
 SYMBOL = os.getenv("SYMBOL", "XAU/USD")
 OUTPUTSIZE = int(os.getenv("OUTPUTSIZE", "5000"))
@@ -126,8 +117,7 @@ if CAPITAL_PRICE not in ("bid", "mid", "ask"):
 LOOKBACK_BARS = int(os.getenv("LOOKBACK_BARS", "2"))     # se miran las 2 ultimas velas; el filtro de edad decide
 MAX_AGE_MIN = float(os.getenv("MAX_AGE_MIN", "10"))      # M15
 # H1 y H4 toleran mas retraso: si la corrida de justo-al-cierre no vio la vela, la siguiente (15 min despues) la rescata.
-MAX_AGE_BY_TF = {15: MAX_AGE_MIN, 30: float(os.getenv("MAX_AGE_M30", "20")),
-                 60: float(os.getenv("MAX_AGE_H1", "20")), 240: float(os.getenv("MAX_AGE_H4", "30"))}
+MAX_AGE_BY_TF = {15: MAX_AGE_MIN, 60: float(os.getenv("MAX_AGE_H1", "20")), 240: float(os.getenv("MAX_AGE_H4", "30"))}
 CLOSE_MARGIN_S = float(os.getenv("CLOSE_MARGIN_S", "3"))
 MAX_WAIT_S = float(os.getenv("MAX_WAIT_S", "100"))
 VERIFY_MAX_S = float(os.getenv("VERIFY_MAX_S", "40"))      # tope de espera hasta que la vela quede FINAL
@@ -201,16 +191,6 @@ MIN_RISK_USD = 3.50        # minRiskUSD (anti-spread)
 USE_FVG_TRIG = env_bool("USE_FVG_TRIG", True)     # interruptor del Lab
 USE_SQUEEZE = env_bool("USE_SQUEEZE", True)       # interruptor del Lab
 
-# ---- FILTRO ELITE: SOLO M30 (no afecta a M15, H1 ni H4) ----
-# Solo se avisa una senal M30 si, ademas de cumplir todas las reglas normales de M30:
-#   1) su puntuacion (de 11) es >= M30_MIN_SCORE, y
-#   2) (opcional) barrio un nivel clave: PDH/PDL, rango de Asia o extremo de 35 velas, y
-#   3) (opcional, apagado por defecto) ocurrio dentro de una killzone (Londres o Nueva York).
-M30_ELITE = env_bool("M30_ELITE", True)
-M30_MIN_SCORE = int(os.getenv("M30_MIN_SCORE", "7"))
-M30_NEED_SWEEP = env_bool("M30_NEED_SWEEP", True)
-M30_NEED_KZ = env_bool("M30_NEED_KZ", False)
-
 # Medidor (backtest)
 BT_SPREAD = float(os.getenv("BACKTEST_SPREAD", "0.5"))     # spreadUSD
 BT_EVAL_BARS = int(os.getenv("BACKTEST_EVAL_BARS", "55"))  # evalBars
@@ -231,9 +211,6 @@ def profile(tf):
     if tf == 15:      # isM15
         return dict(name="M15 Frecuente", htf="240", wick=0.35, cooldown=6, space_bars=10, space_atr=1.0,
                     min_score=5, adx_min=ADX_MIN, vol=VOL_MULT)
-    if tf == 30:      # isM30 (igual que el Pine: HTF diario, mecha 0.35, ADX 15)
-        return dict(name="M30", htf="D", wick=0.35, cooldown=7, space_bars=11, space_atr=0.95,
-                    min_score=MIN_SCORE, adx_min=15.0, vol=VOL_MULT)
     if 60 <= tf < 240:   # isH1_H3
         return dict(name="H1", htf="240", wick=MIN_WICK, cooldown=7, space_bars=12, space_atr=0.85,
                     min_score=MIN_SCORE, adx_min=13.0, vol=VOL_MULT)
@@ -476,8 +453,7 @@ def fetch_bars(tf, extended=False):
         raw = fetch_capital(60, 11 if extended else 5) if DATA_SOURCE == "capital" else fetch_twelvedata(60)
         return aggregate_h4(raw)
     if DATA_SOURCE == "capital":
-        # "ext" solo existe en M30; en M15/H1/H4 el .get da 0 y el calculo es el de siempre.
-        w = max(TF_INFO[tf]["win"], TF_INFO[tf].get("ext", 0), WINDOWS_EXTENDED) if extended else TF_INFO[tf]["win"]
+        w = max(TF_INFO[tf]["win"], WINDOWS_EXTENDED) if extended else TF_INFO[tf]["win"]
         return fetch_capital(tf, w)
     return fetch_twelvedata(tf)
 
@@ -775,18 +751,6 @@ def run_v8(bars, trace=None):
                      and test_ema_bull and not (ANTI_IMP and strong_dn) and space_buy and cool_ok
                      and atr_ok and adx_ok and time_ok and squeeze_ok)
 
-        # ---- FILTRO ELITE: SOLO M30 (en M15/H1/H4 elite_on es False y estas dos lineas no cambian nada) ----
-        sweep_bear = sw_pd_h or sw_as_h or sw_nb_h
-        sweep_bull = sw_pd_l or sw_as_l or sw_nb_l
-        in_kz = any(in_sess(mins, (kz_a, kz_b)) for _kz_name, kz_a, kz_b in KILLZONES)
-        elite_on = (TF == 30 and M30_ELITE)
-        elite_bear = (not elite_on) or (ev_bear >= M30_MIN_SCORE and (sweep_bear or not M30_NEED_SWEEP)
-                                        and (in_kz or not M30_NEED_KZ))
-        elite_bull = (not elite_on) or (ev_bull >= M30_MIN_SCORE and (sweep_bull or not M30_NEED_SWEEP)
-                                        and (in_kz or not M30_NEED_KZ))
-        sell_ready = sell_ready and elite_bear
-        buy_ready = buy_ready and elite_bull
-
         # ---- SL al extremo de la vela del rechazo ----
         sl_s = h + SL_BUFFER * a
         if sl_s - c < MIN_SL_ATR * a:
@@ -819,9 +783,6 @@ def run_v8(bars, trace=None):
                 ("filtro compresion", squeeze_ok, ""),
                 ("riesgo", 0 < risk_s <= max_risk * a and risk_s >= MIN_RISK_USD,
                  "riesgo $%.2f (min $%.2f, max %.1f ATR = $%.2f)" % (risk_s, MIN_RISK_USD, max_risk, max_risk * a)),
-                ("filtro ELITE M30", elite_bear,
-                 "puntos %d (min %d), barrido %s, killzone %s"
-                 % (ev_bear, M30_MIN_SCORE, "SI" if sweep_bear else "NO", "SI" if in_kz else "NO")),
             ], bull=[
                 ("gatillo", bull_classic or (USE_FVG_TRIG and bull_fvg),
                  "mecha inf %.2f (min %.2f), cuerpo %.2f (min 0.22), rango %.2f ATR (min %.2f), vela %s"
@@ -838,19 +799,16 @@ def run_v8(bars, trace=None):
                 ("filtro compresion", squeeze_ok, ""),
                 ("riesgo", 0 < risk_b <= max_risk * a and risk_b >= MIN_RISK_USD,
                  "riesgo $%.2f (min $%.2f, max %.1f ATR = $%.2f)" % (risk_b, MIN_RISK_USD, max_risk, max_risk * a)),
-                ("filtro ELITE M30", elite_bull,
-                 "puntos %d (min %d), barrido %s, killzone %s"
-                 % (ev_bull, M30_MIN_SCORE, "SI" if sweep_bull else "NO", "SI" if in_kz else "NO")),
             ])
 
         if sell_sig:
             last_bar, last_px = i, c
             sigs.append(dict(side="VENTA", i=i, label_i=i, close=c, sl=sl_s, risk=risk_s, atr=a,
-                             trig=0 if bear_classic else 1, score=ev_bear, sweep=sweep_bear))
+                             trig=0 if bear_classic else 1, score=ev_bear))
         if buy_sig:
             last_bar, last_px = i, c
             sigs.append(dict(side="COMPRA", i=i, label_i=i, close=c, sl=sl_b, risk=risk_b, atr=a,
-                             trig=0 if bull_classic else 1, score=ev_bull, sweep=sweep_bull))
+                             trig=0 if bull_classic else 1, score=ev_bull))
     return sigs
 
 
@@ -1004,9 +962,6 @@ def build_message(s, bars, now=None):
              "TP 1:1 %.2f | 1:1.5 %.2f | 1:2 %.2f | 1:3 %.2f"
              % tuple(s["close"] + d * rr * s["risk"] for rr in RRS),
              "Vela %s cerrada: %s (hora Ecuador)" % (tf_name(), fmt_t(close_time))]
-    if TF == 30 and M30_ELITE:
-        lines.insert(2, "\u2B50 Senal ELITE M30: calidad %d/11%s"
-                     % (s["score"], " | barrido de nivel clave confirmado" if s.get("sweep") else ""))
     delay = (now - close_time).total_seconds()
     if delay > 120:
         lines.append("\u23F1 Aviso con %d min de retraso tras el cierre: revisa que el precio no se haya alejado de la entrada."
@@ -1164,9 +1119,6 @@ def run_backtest():
     print("Entrada = cierre de la vela de la senal. Spread $%.2f descontado en R. Evaluacion maxima %d velas. "
           "Si una vela toca SL y objetivo a la vez, cuenta SL." % (BT_SPREAD, BT_EVAL_BARS))
     print("Interruptores: FVG %s | compresion %s" % ("on" if USE_FVG_TRIG else "off", "on" if USE_SQUEEZE else "off"))
-    print("Filtro ELITE M30: %s (puntuacion >= %d, barrido %s, killzone %s)"
-          % ("on" if M30_ELITE else "off", M30_MIN_SCORE, "exigido" if M30_NEED_SWEEP else "no exigido",
-             "exigida" if M30_NEED_KZ else "no exigida"))
     ok_count = 0
     for tf in TIMEFRAMES:
         set_tf(tf)
@@ -1565,7 +1517,7 @@ def main():
     ap.add_argument("--mode", default="normal",
                     choices=["normal", "test", "history", "velas", "capital", "noticias", "backtest", "explicar", "h4lab"])
     ap.add_argument("--tf", type=int, default=15, choices=sorted(TF_INFO),
-                    help="temporalidad en minutos para capital / history / velas (15, 30, 60 o 240)")
+                    help="temporalidad en minutos para capital / history / velas (15, 60 o 240)")
     ap.add_argument("--csv", help="(pruebas) leer velas de un CSV en vez de la API")
     args = ap.parse_args()
     now = datetime.now(timezone.utc)
